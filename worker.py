@@ -2,7 +2,7 @@ import asyncio
 from temporalio.client import Client
 from temporalio.worker import Worker
 from activities import (
-    parse_file_activitн,
+    parse_file_activity,
     analyze_tz_activity,
     generate_proposal_activity,
     save_budget_stub,

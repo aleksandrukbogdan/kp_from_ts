@@ -1,10 +1,11 @@
 from datetime import timedelta
 from temporalio import workflow
 from activities import (
-    parse_file_activite,
+    parse_file_activity,
     analyze_tz_activity,
     generate_proposal_activity,
-    save_budget_stub
+    save_budget_stub,
+    ocr_document_activity
 )
 
 @workflow.defn
@@ -14,6 +15,8 @@ class ProposalWorkflow:
         self.final_proposal = None
         self.is_approved = None
         self.status = "PROCESSING"
+        self.budget = None
+        self.rates = None
     
     @workflow.query
     def get_data(self):
@@ -24,9 +27,10 @@ class ProposalWorkflow:
         }
     
     @workflow.signal
-    def user_approve_signal(self, updated_data:dict, price: float):
-        self.extracted_data = updated_data
-        self.extracted_data["price"] = price #заглушка расчетного блока
+    def user_approve_signal(self, payload: dict):
+        self.extracted_data = payload.get("updated_data")
+        self.budget = payload.get("budget")
+        self.rates = payload.get("rates")
         self.is_approved = True
         
     @workflow.run
@@ -35,7 +39,7 @@ class ProposalWorkflow:
         text = await workflow.execute_activity(
             parse_file_activity,
             args=[file_content, file_name],
-            task_queue="main_queue",
+            task_queue="proposal-queue",
             start_to_close_timeout=timedelta(minutes=1)
         )
         #сканы
@@ -49,7 +53,7 @@ class ProposalWorkflow:
         #анализ ТЗ
         self.extracted_data = await workflow.execute_activity(
             analyze_tz_activity,
-            text,
+            args=[text],
             task_queue="gpu-queue",
             start_to_close_timeout=timedelta(minutes=2)
         )
@@ -61,14 +65,14 @@ class ProposalWorkflow:
 
         self.final_proposal = await workflow.execute_activity(
             generate_proposal_activity,
-            args=[self.extracted_data, self.extracted_data['price']],
+            args=[self.extracted_data, self.budget, self.rates],
             task_queue="gpu-queue",
             start_to_close_timeout=timedelta(minutes=2)
         )
         await workflow.execute_activity(
             save_budget_stub,
             self.extracted_data,
-            task_queue="main-queue",
+            task_queue="proposal-queue",
             start_to_close_timeout=timedelta(seconds=10)
         )
         

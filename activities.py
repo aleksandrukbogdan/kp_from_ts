@@ -15,12 +15,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-client = OpenAI(
-    base_url=os.getenv("QWEN_BASE_URL"),
-    api_key=os.getenv("QWEN_API_KEY"),
-)
+# client = OpenAI(...)  <-- Removed global init
 
-model = os.getenv("QWEN_MODEL_NAME")
+
+MODEL_NAME = os.getenv("QWEN_MODEL_NAME")
 
 @activity.defn
 async def parse_file_activity(file_content:bytes, file_name:str) -> str:
@@ -58,7 +56,11 @@ async def ocr_document_activity(file_bytes: bytes) -> str:
         ],
     }]
 
-    response = ai_client.chat.completions.create(
+    client = OpenAI(
+        base_url=os.getenv("QWEN_BASE_URL"),
+        api_key=os.getenv("QWEN_API_KEY"),
+    )
+    response = client.chat.completions.create(
         model=MODEL_NAME, messages=messages, max_tokens=2048
     )
     return response.choices[0].message.content
@@ -74,13 +76,22 @@ async def save_budget_stub(data: dict) -> str:
 async def analyze_tz_activity(text: str) -> dict:
     """Анализ ТЗ и извлечение JSON"""
     prompt = f"""
-    Проанализируй текст ТЗ и извлеки ключевую информацию в формате JSON.
-    Поля: client_name, project_type, deadline, key_features (list), tech_stack.
+    1. "client_name": Название компании.
+    2. "business_goals": Список ключевых задач бизнеса (какие проблемы решает продукт, зачем он нужен).
+    3. "project_essence": Краткая суть проекта в 1-2 предложениях (Summary).
+    4. "key_features": Список функциональных требований.
+    5. "tech_stack": Рекомендуемый стек.
+    6. "project_type": Тип проекта (Web, Mobile, ML, Design).
+
     Верни ТОЛЬКО JSON.
     
     Текст: {text[:10000]}
     """
     
+    client = OpenAI(
+        base_url=os.getenv("QWEN_BASE_URL"),
+        api_key=os.getenv("QWEN_API_KEY"),
+    )
     try:
         response = client.chat.completions.create(
             model=MODEL_NAME,
@@ -101,16 +112,42 @@ async def analyze_tz_activity(text: str) -> dict:
         return {"client_name": "Ошибка анализа", "key_features": []}
 
 @activity.defn
-async def generate_proposal_activity(requirements: dict, price: float) -> str:
+async def generate_proposal_activity(data: dict, budget_matrix: dict, rates: dict) -> str:
     """Генерация текста КП"""
-    #дописать как нам надо
+
+    # Формируем текстовое описание сметы для ИИ из матрицы
+    detailed_budget_text = "Детальный расчет трудозатрат по этапам:\n"
+    total_project_sum = 0
+    
+    for stage, roles_hours in budget_matrix.items():
+        detailed_budget_text += f"Этап '{stage}':\n"
+        for role, hours in roles_hours.items():
+            if hours > 0:
+                rate = rates.get(role, 0)
+                cost = hours * rate
+                total_project_sum += cost
+                detailed_budget_text += f"  - {role}: {hours} ч. по {rate} р./час = {cost} р.\n"
+
     prompt = f"""
-    Напиши коммерческое предложение.
-    Клиент: {requirements.get('client_name')}
-    Бюджет: {price}
-    Фичи: {requirements.get('key_features')}
+    Напиши профессиональное коммерческое предложение.
+
+    ДАННЫЕ ДЛЯ ВКЛЮЧЕНИЯ В ДОКУМЕНТ:
+    1. Суть проекта: {data.get('project_essence')}
+    2. Бизнес-задачи: {data.get('business_goals')}
+    3. Ключевой функционал: {data.get('key_features')}
+    4. Этапы и Стек: {data.get('tech_stack')}
+    
+    ФИНАНСОВЫЙ РАЗДЕЛ (Оформи красиво в Markdown таблице):
+    {detailed_budget_text}
+    ИТОГО СТОИМОСТЬ: {total_project_sum} руб.
+
+    Стиль: Убедительный, деловой.
     """
     
+    client = OpenAI(
+        base_url=os.getenv("QWEN_BASE_URL"),
+        api_key=os.getenv("QWEN_API_KEY"),
+    )
     response = client.chat.completions.create(
         model=MODEL_NAME,
         messages=[{"role": "user", "content": prompt}]
@@ -130,7 +167,11 @@ async def analyze_requirements_activity(text: str) -> dict:
     Текст: {text[:10000]} 
     """ # Обрезаем текст, если слишком длинный
     
-    response = ai_client.chat.completions.create(
+    client = OpenAI(
+        base_url=os.getenv("QWEN_BASE_URL"),
+        api_key=os.getenv("QWEN_API_KEY"),
+    )
+    response = client.chat.completions.create(
         model=MODEL_NAME,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.2
