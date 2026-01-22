@@ -11,7 +11,7 @@ from activities import (
 from workflows import ProposalWorkflow
 
 async def main():
-    client = await Client.connect("localhost:7233") #подключение к темпорал серверу
+    client = await Client.connect("temporal-server:7233") #подключение к темпорал серверу
 #добавить 2 воркера: 1 для обычной очереди другой для gpu
     worker_cpu = Worker(
         client,

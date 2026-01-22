@@ -5,3 +5,4 @@ python-docx
 PyPDF2
 temporalio
 pandas
+flask

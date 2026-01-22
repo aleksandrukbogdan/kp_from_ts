@@ -1,0 +1,31 @@
+[theme]
+# Основной цвет (кнопки, ползунки, акценты)
+# Оранжевый - фирменный цвет НИР-центр
+primaryColor = "#FF6B35"
+
+# Цвет фона основной страницы
+# Теплый белый (как на портале)
+backgroundColor = "#FDF8F6"
+
+# Цвет фона боковой панели (Sidebar)
+secondaryBackgroundColor = "#FFFFFF"
+
+# Цвет текста
+textColor = "#1C1B1F"
+
+# Шрифт
+font = "sans serif"
+
+[server]
+# Важно для Docker: слушать все адреса, а не только localhost
+address = "0.0.0.0"
+port = 8501
+headless = true
+enableCORS = false
+enableXsrfProtection = false
+
+[browser]
+# Отключаем сбор статистики Streamlit (для безопасности)
+gatherUsageStats = false
+# Название вкладки браузера по умолчанию
+serverAddress = "company-ai.internal"

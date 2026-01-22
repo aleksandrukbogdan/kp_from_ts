@@ -1,0 +1,47 @@
+services:
+
+  ai-agent-manager:
+    build: .
+    container_name: ai-agent-manager
+    ports:
+      - "8501:8501"
+    env_file: .env
+    depends_on:
+      - temporal-server
+    networks:
+      - ai_platform_network
+
+  ai-worker-manager:
+    build: .
+    container_name: ai-manager-worker
+    command: python worker.py
+    env_file: .env
+    depends_on:
+      - temporal-server
+    networks:
+      - ai_platform_network
+  temporal-server:
+    image: temporalio/admin-tools:latest
+    container_name: temporal_server
+    entrypoint: [ "/bin/sh", "-c", "temporal server start-dev --ip 0.0.0.0" ]
+    ports:
+      - "7233:7233"
+      - "8233:8233"
+    networks:
+      - ai_platform_network
+
+  portal:
+    build:
+      context: .
+      dockerfile: portal/Dockerfile
+    container_name: ai_portal
+    env_file: .env
+    ports:
+      - "8085:5000"
+    networks:
+      - ai_platform_network
+  #место для модуля rag
+
+networks:
+  ai_platform_network:
+    driver: bridge
