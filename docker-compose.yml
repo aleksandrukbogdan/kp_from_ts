@@ -1,46 +1,58 @@
-services:
+version: '3.8'
 
-  ai-agent-manager:
-    build: .
-    container_name: ai-agent-manager
+services:
+  # 1. Твой новый Frontend (React)
+  # Мы монтируем папку, чтобы ты мог менять код и видеть результат сразу (Hot Reload)
+  frontend:
+    image: node:22-alpine
+    container_name: react_frontend
+    working_dir: /app
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    command: sh -c "npm install && npm run dev -- --host"
     ports:
-      - "8501:8501"
+      - "5173:5173"
+    depends_on:
+      - api
+    networks:
+      - ai_platform_network
+
+  # 2. Твой новый Backend (FastAPI)
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: fastapi_backend
+    ports:
+      - "8000:8000"
     env_file: .env
     depends_on:
       - temporal-server
     networks:
       - ai_platform_network
 
-  ai-worker-manager:
-    build: .
-    container_name: ai-manager-worker
+  # 3. Твой Worker (Остался без изменений!)
+  ai-worker-kp:
+    build: . # Использует стандартный Dockerfile (можно оставить как есть, он универсален)
+    container_name: agent_kp_worker
     command: python worker.py
     env_file: .env
     depends_on:
       - temporal-server
     networks:
       - ai_platform_network
+
+  # 4. Temporal Server
   temporal-server:
     image: temporalio/admin-tools:latest
     container_name: temporal_server
-    entrypoint: [ "/bin/sh", "-c", "temporal server start-dev --ip 0.0.0.0" ]
+    entrypoint: [ "/bin/bash", "-c", "temporal server start-dev --ip 0.0.0.0" ]
     ports:
       - "7233:7233"
       - "8233:8233"
     networks:
       - ai_platform_network
-
-  portal:
-    build:
-      context: .
-      dockerfile: portal/Dockerfile
-    container_name: ai_portal
-    env_file: .env
-    ports:
-      - "8085:5000"
-    networks:
-      - ai_platform_network
-  #место для модуля rag
 
 networks:
   ai_platform_network:
