@@ -9,7 +9,8 @@ export const config = {
     SERVER_HOST,
 
     // API адреса
-    API_URL: `http://${SERVER_HOST}:8000/api`,
+    // Используем относительный путь, чтобы запросы шли через Vite Proxy (на порт 8090 -> 5173 -> api:8000)
+    API_URL: '/api',
 
     // Внешние сервисы
     RAG_BOT_URL: `http://10.109.50.250:5111`,

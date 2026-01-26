@@ -1,8 +1,7 @@
 version: '3.8'
 
 services:
-  # 1. Твой новый Frontend (React)
-  # Мы монтируем папку, чтобы ты мог менять код и видеть результат сразу (Hot Reload)
+  # 1. Frontend (React + Vite Proxy)
   frontend:
     image: node:22-alpine
     container_name: react_frontend
@@ -12,29 +11,31 @@ services:
       - /app/node_modules
     command: sh -c "npm install && npm run dev -- --host"
     ports:
-      - "5173:5173"
+      - "8090:5173" # Доступ к сайту через http://IP:8090
     depends_on:
       - api
     networks:
       - ai_platform_network
 
-  # 2. Твой новый Backend (FastAPI)
+  # 2. Backend (FastAPI)
   api:
     build:
       context: .
       dockerfile: Dockerfile.api
     container_name: fastapi_backend
-    ports:
-      - "8000:8000"
+    # Порт 8000 внутри сети (доступен для Frontend через http://api:8000)
+    # Если нужно тестировать API снаружи, можно раскомментировать:
+    # ports:
+    #   - "8000:8000" 
     env_file: .env
     depends_on:
       - temporal-server
     networks:
       - ai_platform_network
 
-  # 3. Твой Worker (Остался без изменений!)
+  # 3. Worker (Python Temporal Worker)
   ai-worker-kp:
-    build: . # Использует стандартный Dockerfile (можно оставить как есть, он универсален)
+    build: . 
     container_name: agent_kp_worker
     command: python worker.py
     env_file: .env
@@ -49,8 +50,8 @@ services:
     container_name: temporal_server
     entrypoint: [ "/bin/bash", "-c", "temporal server start-dev --ip 0.0.0.0" ]
     ports:
-      - "7233:7233"
-      - "8233:8233"
+      - "7233:7233" # Порт для Worker'ов и Client'ов (gRPC)
+      - "8233:8233" # Порт для Web UI (Temporal UI)
     networks:
       - ai_platform_network
 

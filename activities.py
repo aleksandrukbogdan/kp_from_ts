@@ -24,22 +24,65 @@ MODEL_NAME = os.getenv("QWEN_MODEL_NAME")
 async def parse_file_activity(file_content:bytes, file_name:str) -> str:
     file_type = file_name.split('.')[-1].lower()
     
-    if file_type == 'docx':
-        doc = Document(io.BytesIO(file_content))
-        text = '\n'.join([para.text for para in doc.paragraphs if para.text.strip()])
-        return text
+    # --- Docling Integration ---
+    from docling.datamodel.base_models import InputFormat
+    from docling.document_converter import DocumentConverter, PdfFormatOption
+    from docling.datamodel.pipeline_options import PdfPipelineOptions, AcceleratorOptions, AcceleratorDevice
+
+    # Настройка Docling для использования GPU (если доступно)
+    # Важно: это должно выполняться внутри activity или при старте worker'а.
+    # Для эффективности можно создать глобальный converter, но с осторожностью в мультипроцессинге.
+    # Temporal activities запускаются в asyncio loop, Docling синхронный/асинхронный.
+
+    try:
+        # Настройка пайплайна для PDF
+        pipeline_options = PdfPipelineOptions()
+        pipeline_options.do_ocr = True
+        pipeline_options.do_table_structure = True
+        pipeline_options.table_structure_options.do_cell_matching = True
+        
+        # Настройка ускорителя (GPU)
+        pipeline_options.accelerator_options = AcceleratorOptions(
+            num_threads=4, device=AcceleratorDevice.CUDA
+        )
+
+        doc_converter = DocumentConverter(
+            format_options={
+                InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
+            }
+        )
+    except Exception as e:
+        print(f"Ошибка инициализации Docling: {e}. Используем fallback.")
+        doc_converter = DocumentConverter() # Fallback config
+
+    # Сохраняем во временный файл, так как Docling работает с путями или потоками
+    # Для простоты используем BytesIO, если Docling поддерживает, или tempfile
     
-    elif file_type == 'pdf':
-        pdf_reader = PyPDF2.PdfReader(io.BytesIO(file_content))
-        text = ''
-        for page in pdf_reader.pages:
-            text += page.extract_text() + '\n'
-        return text.strip()
-    
-    elif file_type == 'txt':
-        return file_content.decode('utf-8')
-    
-    return 'Неподдерживаемый формат'
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=f".{file_type}") as tmp_file:
+        tmp_file.write(file_content)
+        tmp_path = Path(tmp_file.name)
+
+    try:
+        # Конвертация
+        print(f"Начинаю парсинг файла {file_name} с помощью Docling...")
+        result = doc_converter.convert(tmp_path)
+        
+        # Получение Markdown
+        markdown_text = result.document.export_to_markdown()
+        
+        # Удаляем временный файл
+        os.unlink(tmp_path)
+        
+        return markdown_text
+
+    except Exception as e:
+        print(f"Ошибка Docling: {e}")
+        if os.path.exists(tmp_path):
+             os.unlink(tmp_path)
+        return f"Ошибка при обработке файла: {e}"
 
 @activity.defn
 async def ocr_document_activity(file_bytes: bytes) -> str:
