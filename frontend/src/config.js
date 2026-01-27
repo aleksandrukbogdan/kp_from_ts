@@ -15,6 +15,7 @@ export const config = {
     // Внешние сервисы
     RAG_BOT_URL: `http://10.109.50.250:5111`,
     VKS_SUMMARY_URL: `http://10.109.50.250:5000`,
+    ANONYMIZER_URL: `http://10.109.50.250:5053`,
 };
 
 export default config;

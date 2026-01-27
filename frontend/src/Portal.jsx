@@ -59,7 +59,7 @@ export default function Portal() {
         },
         {
             title: "RAG",
-            desc: "Создайте собственный чат-бот",
+            desc: "Задавайте вопросы по своим документам",
             icon: <Chat fontSize="large" sx={{ color: 'white' }} />,
             gradient: 'linear-gradient(135deg, #1E3A5F 0%, #3D5A80 100%)',
             path: config.RAG_BOT_URL,
@@ -67,7 +67,7 @@ export default function Portal() {
             external: true
         },
         {
-            title: "ВКС Саммери",
+            title: "ВКС резюмирование",
             desc: "Расшифровка и итоги встреч",
             icon: <Mic fontSize="large" sx={{ color: 'white' }} />,
             gradient: 'linear-gradient(135deg, #388E3C 0%, #66BB6A 100%)',
@@ -80,9 +80,9 @@ export default function Portal() {
             desc: "Скрытие чувствительных данных",
             icon: <VisibilityOff fontSize="large" sx={{ color: 'white' }} />,
             gradient: 'linear-gradient(135deg, #757575 0%, #9E9E9E 100%)',
-            path: "/anon",
-            active: false,
-            external: false
+            path: config.ANONYMIZER_URL,
+            active: true,
+            external: true
         }
     ];
 

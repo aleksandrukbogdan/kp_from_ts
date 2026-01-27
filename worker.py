@@ -4,6 +4,7 @@ from temporalio.worker import Worker
 from activities import (
     parse_file_activity,
     analyze_tz_activity,
+    estimate_hours_activity,
     generate_proposal_activity,
     save_budget_stub,
     ocr_document_activity
@@ -24,7 +25,7 @@ async def main():
         client,
         task_queue="gpu-queue",
         # workflow тут не нужен, только активности
-        activities=[ocr_document_activity, analyze_tz_activity, generate_proposal_activity]
+        activities=[ocr_document_activity, analyze_tz_activity, estimate_hours_activity, generate_proposal_activity]
     )
     print("Workers started")
     await asyncio.gather(worker_cpu.run(), worker_gpu.run())

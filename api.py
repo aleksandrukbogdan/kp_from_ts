@@ -84,8 +84,10 @@ async def start_workflow(
     client = await get_temporal_client()
     content = await file.read()
     
-    # Уникальный ID для идемпотентности
-    wf_id = f"cp-{file.filename}-{len(content)}"
+    # Генерация чистого ID (MD5 hash) для красивых логов и кэширования одинаковых файлов
+    import hashlib
+    file_hash = hashlib.md5((file.filename + str(len(content))).encode()).hexdigest()
+    wf_id = f"cp-{file_hash}"
     
     try:
         handle = await client.start_workflow(

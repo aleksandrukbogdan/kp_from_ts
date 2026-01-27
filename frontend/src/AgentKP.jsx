@@ -4,10 +4,12 @@ import {
   Box, CircularProgress, Table, TableBody, TableContainer,
   TableCell, TableHead, TableRow, IconButton, Chip,
   Dialog, DialogTitle, DialogContent, DialogActions,
-  AppBar, Toolbar, Avatar, Menu, MenuItem, Divider
+  AppBar, Toolbar, Avatar, Menu, MenuItem, Divider,
+  Alert, AlertTitle, Collapse
 } from '@mui/material';
 import {
-  CloudUpload, CheckCircle, Add, Delete, Refresh, ArrowBack, Logout, Person, GetApp
+  CloudUpload, CheckCircle, Add, Delete, Refresh, ArrowBack, Logout, Person, GetApp,
+  Warning, Error as ErrorIcon, SyncProblem
 } from '@mui/icons-material';
 import axios from 'axios';
 import { useNavigate } from 'react-router-dom';
@@ -54,6 +56,21 @@ export default function AgentKP() {
   const [newRoleName, setNewRoleName] = useState("");
   const [newRoleRate, setNewRoleRate] = useState(2500);
   const [newStageName, setNewStageName] = useState("");
+
+  // --- Новые состояния для фич ---
+  const [requirementIssues, setRequirementIssues] = useState([]);
+  const [sourceExcerpts, setSourceExcerpts] = useState({});
+  const [rawText, setRawText] = useState('');
+  const [suggestedHours, setSuggestedHours] = useState({});
+  const [selectedItem, setSelectedItem] = useState(null);  // {field, text, source} - выбранный пункт
+  const [userModified, setUserModified] = useState({});  // {этап: {роль: true/false}}
+
+  // Хелпер: найти issue для пункта
+  const getIssueForItem = (fieldName, itemText) => {
+    return requirementIssues.find(
+      issue => issue.field === fieldName && issue.item_text === itemText
+    );
+  };
 
   useEffect(() => {
     const user = getCookie('portal_user');
@@ -109,22 +126,62 @@ export default function AgentKP() {
         // Когда ИИ закончил анализ, сохраняем данные
         if (state.status === "WAITING_FOR_HUMAN" && state.extracted_data && !data) {
           const raw = state.extracted_data;
-          // Преобразуем массивы в строки для удобного редактирования
+
+          // Преобразуем массивы объектов {text, source} в строки для редактирования
+          // При этом сохраняем оригиналы для отображения цитат
+          const extractTextArray = (arr) => {
+            if (!Array.isArray(arr)) return [];
+            return arr.map(item => typeof item === 'object' ? item.text : item);
+          };
+
           const formattedData = {
             ...raw,
-            business_goals: formatDataToString(raw.business_goals),
-            key_features: formatDataToString(raw.key_features),
-            tech_stack: formatDataToString(raw.tech_stack),
+            business_goals: extractTextArray(raw.business_goals).join('\n'),
+            key_features: extractTextArray(raw.key_features).join('\n'),
+            tech_stack: extractTextArray(raw.tech_stack).join('\n'),
+            client_integrations: extractTextArray(raw.client_integrations).join('\n'),
+            // Сохраняем оригинальные массивы для показа цитат
+            _original: raw
           };
           setData(formattedData);
 
-          // Инициализируем матрицу нулями, чтобы не было undefined
+          // Сохраняем новые данные
+          setRequirementIssues(raw.requirement_issues || []);
+          setSourceExcerpts(raw.source_excerpts || {});
+          setRawText(state.raw_text || '');
+          setSuggestedHours(state.suggested_hours || {});
+
+          // Используем этапы и роли, предложенные ИИ
+          const aiStages = state.suggested_stages || ["Сбор данных", "Прототип", "Разработка", "Тестирование"];
+          const aiRoles = state.suggested_roles || ["Менеджер", "Frontend", "Backend", "Дизайнер"];
+
+          setStages(aiStages);
+          // Инициализируем роли с дефолтными ставками
+          const defaultRates = { "Менеджер": 2500, "ML-Инженер": 3500, "Frontend": 3000, "Backend": 3000, "Дизайнер": 2800, "QA": 2200, "DevOps": 3200 };
+          const rolesWithRates = {};
+          aiRoles.forEach(r => {
+            rolesWithRates[r] = defaultRates[r] || 2500; // дефолтная ставка если роль неизвестна
+          });
+          setRoles(rolesWithRates);
+
+          // Инициализируем матрицу подсказками от ИИ
           const initialMatrix = {};
-          stages.forEach(s => {
+          const suggestedMatrix = state.suggested_hours || {};
+          aiStages.forEach(s => {
             initialMatrix[s] = {};
-            Object.keys(roles).forEach(r => initialMatrix[s][r] = 0);
+            aiRoles.forEach(r => {
+              initialMatrix[s][r] = suggestedMatrix[s]?.[r] || 0;
+            });
           });
           setBudgetMatrix(initialMatrix);
+
+          // Инициализируем userModified как false для всех ячеек
+          const initialModified = {};
+          aiStages.forEach(s => {
+            initialModified[s] = {};
+            aiRoles.forEach(r => initialModified[s][r] = false);
+          });
+          setUserModified(initialModified);
         }
 
         // Когда все готово
@@ -148,6 +205,14 @@ export default function AgentKP() {
       [stage]: {
         ...prev[stage],
         [role]: val
+      }
+    }));
+    // Помечаем ячейку как изменённую пользователем
+    setUserModified(prev => ({
+      ...prev,
+      [stage]: {
+        ...prev[stage],
+        [role]: true
       }
     }));
   };
@@ -399,237 +464,681 @@ export default function AgentKP() {
 
         {/* БЛОК 3: ПРОВЕРКА (HUMAN IN THE LOOP) */}
         {status === "WAITING_FOR_HUMAN" && data && (
-          <Paper elevation={0} sx={{ p: 4, borderRadius: 4 }}>
-            <Typography variant="h5" gutterBottom fontWeight={600} sx={{ mb: 3 }}>
-              📊 Проверка данных
-            </Typography>
+          <Paper elevation={0} sx={{ p: 0, bgcolor: 'transparent' }}>
 
-            <Box display="grid" gridTemplateColumns={{ xs: '1fr', md: '1fr 1fr' }} gap={3} mb={3}>
-              <TextField
-                label="Клиент"
-                fullWidth
-                variant="outlined"
-                value={data.client_name || ''}
-                onChange={(e) => setData({ ...data, client_name: e.target.value })}
-              />
-              <TextField
-                label="Суть проекта"
-                fullWidth
-                multiline
-                rows={3}
-                variant="outlined"
-                value={data.project_essence || ''}
-                onChange={(e) => setData({ ...data, project_essence: e.target.value })}
-              />
-            </Box>
+            {/* Основной layout: контент + боковая панель */}
+            <Box display="flex" gap={3}>
 
-            <TextField
-              label="Бизнес-задачи"
-              fullWidth
-              multiline
-              rows={4}
-              variant="outlined"
-              value={data.business_goals || ''}
-              onChange={(e) => setData({ ...data, business_goals: e.target.value })}
-              sx={{ mb: 3 }}
-            />
+              {/* Левая часть: основной контент */}
+              <Box flex={2}>
+                <Container maxWidth="md" disableGutters>
+                  <Typography variant="h4" gutterBottom fontWeight={700} sx={{ mb: 3, letterSpacing: '-0.02em' }}>
+                    Проверка данных
+                  </Typography>
 
-            <TextField
-              label="Ключевой функционал"
-              fullWidth
-              multiline
-              rows={6}
-              variant="outlined"
-              value={data.key_features || ''}
-              onChange={(e) => setData({ ...data, key_features: e.target.value })}
-              sx={{ mb: 3 }}
-            />
+                  {/* БЛОК ПРОБЛЕМНЫХ ТРЕБОВАНИЙ */}
+                  {requirementIssues.length > 0 && (
+                    <Paper
+                      elevation={0}
+                      sx={{
+                        p: 2.5,
+                        mb: 3,
+                        bgcolor: '#FFF8E1', // Amber 50
+                        borderRadius: 2,
+                        border: '1px solid',
+                        borderColor: '#FFE082' // Amber 200
+                      }}
+                    >
+                      <Box display="flex" alignItems="center" gap={1} mb={2}>
+                        <Warning sx={{ color: '#F57C00' }} />
+                        <Typography variant="h6" fontWeight={600} color="#E65100">
+                          Проблемные требования ({requirementIssues.length})
+                        </Typography>
+                      </Box>
 
-            <TextField
-              label="Стек и технологии"
-              fullWidth
-              multiline
-              rows={2}
-              variant="outlined"
-              value={data.tech_stack || ''}
-              onChange={(e) => setData({ ...data, tech_stack: e.target.value })}
-              helperText="Если не указано в ТЗ, можно оставить как есть или дополнить вручную"
-              sx={{ mb: 4 }}
-            />
+                      <Box display="flex" flexDirection="column" gap={1.5}>
+                        {requirementIssues.map((issue, idx) => {
+                          // Определяем стиль в зависимости от типа проблемы
+                          const getIssueStyle = (type) => {
+                            switch (type) {
+                              case 'questionable':
+                                return {
+                                  severity: 'warning',
+                                  icon: <Warning fontSize="small" />,
+                                  label: 'Неясное требование',
+                                  color: '#ED6C02'
+                                };
+                              case 'impossible':
+                                return {
+                                  severity: 'error',
+                                  icon: <ErrorIcon fontSize="small" />,
+                                  label: 'Нереализуемое',
+                                  color: '#D32F2F'
+                                };
+                              case 'contradictory':
+                                return {
+                                  severity: 'info',
+                                  icon: <SyncProblem fontSize="small" />,
+                                  label: 'Противоречие',
+                                  color: '#0288D1'
+                                };
+                              default:
+                                return {
+                                  severity: 'warning',
+                                  icon: <Warning fontSize="small" />,
+                                  label: 'Проблема',
+                                  color: '#ED6C02'
+                                };
+                            }
+                          };
+                          const style = getIssueStyle(issue.type);
 
-            {/* ТАБЛИЦА СМЕТЫ */}
-            <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
-              <Typography variant="h6" fontWeight={600}>Матрица трудозатрат</Typography>
-              <Box>
-                <Button
-                  startIcon={<Add />}
-                  onClick={() => setOpenStageDialog(true)}
-                  sx={{ color: 'primary.main' }}
-                >
-                  Этап
-                </Button>
-                <Button
-                  startIcon={<Add />}
-                  onClick={() => setOpenRoleDialog(true)}
-                  sx={{ color: 'primary.main' }}
-                >
-                  Роль
-                </Button>
+                          return (
+                            <Alert
+                              key={idx}
+                              severity={style.severity}
+                              icon={style.icon}
+                              sx={{
+                                '& .MuiAlert-message': { width: '100%' },
+                                borderRadius: 1.5
+                              }}
+                            >
+                              <Box display="flex" justifyContent="space-between" alignItems="flex-start" mb={0.5}>
+                                <AlertTitle sx={{ fontWeight: 600, mb: 0 }}>{style.label}</AlertTitle>
+                                {issue.field && (
+                                  <Chip label={issue.field.replace(/_/g, ' ')} size="small" variant="outlined" sx={{ textTransform: 'capitalize' }} />
+                                )}
+                              </Box>
+                              <Typography variant="body2" sx={{ mb: 0.5 }}>
+                                <strong>Текст:</strong> {issue.item_text || issue.text}
+                              </Typography>
+                              <Typography variant="body2" color="text.secondary">
+                                <strong>Причина:</strong> {issue.reason}
+                              </Typography>
+                            </Alert>
+                          );
+                        })}
+                      </Box>
+                    </Paper>
+                  )}
+
+                  {/* BENTO GRID LAYOUT */}
+                  <Box display="grid" gridTemplateColumns={{ xs: '1fr', md: '1fr 1fr' }} gap={3} sx={{ mb: 4 }}>
+
+                    {/* 1. КЛИЕНТ */}
+                    <Paper
+                      elevation={0}
+                      onClick={() => setSelectedItem({ field: 'client_name', text: data.client_name, source: sourceExcerpts.client_name })}
+                      sx={{
+                        p: 2,
+                        bgcolor: selectedItem?.field === 'client_name' ? 'rgba(25, 118, 210, 0.08)' : 'white',
+                        borderRadius: 2,
+                        border: '1px solid',
+                        borderColor: selectedItem?.field === 'client_name' ? 'primary.main' : 'divider',
+                        cursor: 'pointer',
+                        transition: 'all 0.2s ease',
+                        '&:hover': { borderColor: 'primary.light', bgcolor: 'rgba(25, 118, 210, 0.04)' }
+                      }}
+                    >
+                      <Typography variant="subtitle2" color="text.secondary" sx={{ mb: 1, pl: 0.5, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                        Клиент
+                      </Typography>
+                      <TextField
+                        fullWidth
+                        hiddenLabel
+                        variant="filled"
+                        value={data.client_name || ''}
+                        onChange={(e) => setData({ ...data, client_name: e.target.value })}
+                        onClick={(e) => e.stopPropagation()}
+                        InputProps={{ disableUnderline: true, sx: { borderRadius: 1.5, bgcolor: 'grey.50' } }}
+                      />
+                    </Paper>
+
+                    {/* 2. СТЕК ТЕХНОЛОГИЙ */}
+                    <Paper
+                      elevation={0}
+                      sx={{
+                        p: 2,
+                        bgcolor: !data.tech_stack ? '#FFF3E0' : 'white',
+                        borderRadius: 2,
+                        border: '1px solid',
+                        borderColor: !data.tech_stack ? '#FFCC80' : 'divider'
+                      }}
+                    >
+                      <Box display="flex" justifyContent="space-between" alignItems="center" mb={1}>
+                        <Typography variant="subtitle2" color="text.secondary" sx={{ pl: 0.5, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                          Стек технологий
+                        </Typography>
+                        {!data.tech_stack && (
+                          <Chip label="Не указан" size="small" color="warning" variant="outlined" />
+                        )}
+                      </Box>
+                      {/* Кликабельные чипы для стека */}
+                      {data._original?.tech_stack?.length > 0 && (
+                        <Box display="flex" flexWrap="wrap" gap={0.5} mb={1.5}>
+                          {data._original.tech_stack.map((item, idx) => {
+                            const isSelected = selectedItem?.field === 'tech_stack' && selectedItem?.text === item.text;
+                            return (
+                              <Chip
+                                key={idx}
+                                label={item.text}
+                                size="small"
+                                onClick={() => setSelectedItem({ field: 'tech_stack', text: item.text, source: item.source })}
+                                variant={isSelected ? 'filled' : 'outlined'}
+                                color={isSelected ? 'primary' : 'default'}
+                                sx={{ cursor: 'pointer' }}
+                              />
+                            );
+                          })}
+                        </Box>
+                      )}
+                      <TextField
+                        fullWidth
+                        hiddenLabel
+                        variant="filled"
+                        size="small"
+                        value={data.tech_stack || ''}
+                        onChange={(e) => setData({ ...data, tech_stack: e.target.value })}
+                        placeholder="Добавить технологии..."
+                        helperText={!data.tech_stack ? "Если не указано в ТЗ, добавьте вручную" : ""}
+                        InputProps={{ disableUnderline: true, sx: { borderRadius: 1.5, bgcolor: !data.tech_stack ? 'white' : 'grey.50', fontSize: '0.85rem' } }}
+                        FormHelperTextProps={{ sx: { ml: 0, mt: 1, color: 'text.secondary' } }}
+                      />
+                    </Paper>
+
+                    {/* 3. СУТЬ ПРОЕКТА (Full Width) */}
+                    <Paper
+                      elevation={0}
+                      onClick={() => setSelectedItem({ field: 'project_essence', text: data.project_essence, source: sourceExcerpts.project_essence })}
+                      sx={{
+                        gridColumn: '1 / -1',
+                        p: 3,
+                        bgcolor: selectedItem?.field === 'project_essence' ? 'rgba(25, 118, 210, 0.08)' : 'white',
+                        borderRadius: 3,
+                        border: '1px solid',
+                        borderColor: selectedItem?.field === 'project_essence' ? 'primary.main' : 'divider',
+                        cursor: 'pointer',
+                        transition: 'all 0.2s ease',
+                        '&:hover': { borderColor: 'primary.light' }
+                      }}
+                    >
+                      <Typography variant="h6" fontWeight={600} gutterBottom>
+                        Суть проекта
+                      </Typography>
+                      <TextField
+                        fullWidth
+                        hiddenLabel
+                        multiline
+                        variant="filled"
+                        minRows={2}
+                        value={data.project_essence || ''}
+                        onChange={(e) => setData({ ...data, project_essence: e.target.value })}
+                        onClick={(e) => e.stopPropagation()}
+                        InputProps={{ disableUnderline: true, sx: { borderRadius: 2, bgcolor: 'grey.50' } }}
+                      />
+                    </Paper>
+
+                    {/* 4. БИЗНЕС ЗАДАЧИ — список кликабельных пунктов */}
+                    <Paper elevation={0} sx={{ gridColumn: '1 / -1', p: 3, bgcolor: 'white', borderRadius: 3, border: '1px solid', borderColor: 'divider' }}>
+                      <Typography variant="h6" fontWeight={600} gutterBottom>
+                        Бизнес-задачи
+                      </Typography>
+                      <Box display="flex" flexDirection="column" gap={1}>
+                        {data._original?.business_goals?.map((item, idx) => {
+                          const issue = getIssueForItem('business_goals', item.text);
+                          const isSelected = selectedItem?.field === 'business_goals' && selectedItem?.text === item.text;
+                          return (
+                            <Box
+                              key={idx}
+                              onClick={() => setSelectedItem({ field: 'business_goals', text: item.text, source: item.source, issue })}
+                              sx={{
+                                p: 1.5,
+                                borderRadius: 1.5,
+                                cursor: 'pointer',
+                                border: '1px solid',
+                                borderColor: isSelected ? 'primary.main' : (issue ? (issue.type === 'impossible' ? '#D32F2F' : issue.type === 'contradictory' ? '#0288D1' : '#ED6C02') : 'divider'),
+                                bgcolor: isSelected ? 'rgba(25, 118, 210, 0.08)' : (issue ? (issue.type === 'impossible' ? '#FFEBEE' : issue.type === 'contradictory' ? '#E3F2FD' : '#FFF8E1') : 'grey.50'),
+                                transition: 'all 0.2s ease',
+                                '&:hover': { borderColor: issue ? undefined : 'primary.light', bgcolor: isSelected ? undefined : 'rgba(25, 118, 210, 0.04)' }
+                              }}
+                            >
+                              <Box display="flex" alignItems="center" gap={1}>
+                                {issue && (
+                                  issue.type === 'impossible' ? <ErrorIcon fontSize="small" sx={{ color: '#D32F2F' }} /> :
+                                    issue.type === 'contradictory' ? <SyncProblem fontSize="small" sx={{ color: '#0288D1' }} /> :
+                                      <Warning fontSize="small" sx={{ color: '#ED6C02' }} />
+                                )}
+                                <Typography variant="body2">{item.text}</Typography>
+                              </Box>
+                            </Box>
+                          );
+                        })}
+                      </Box>
+                      {/* Текстовое поле для редактирования (сворачиваемое) */}
+                      <TextField
+                        fullWidth
+                        hiddenLabel
+                        multiline
+                        variant="filled"
+                        size="small"
+                        minRows={2}
+                        value={data.business_goals || ''}
+                        onChange={(e) => setData({ ...data, business_goals: e.target.value })}
+                        placeholder="Добавить/редактировать..."
+                        sx={{ mt: 2 }}
+                        InputProps={{ disableUnderline: true, sx: { borderRadius: 1.5, bgcolor: 'grey.50', fontSize: '0.85rem' } }}
+                      />
+                    </Paper>
+
+                    {/* 5. КЛЮЧЕВОЙ ФУНКЦИОНАЛ — список кликабельных пунктов */}
+                    <Paper elevation={0} sx={{ gridColumn: '1 / -1', p: 3, bgcolor: 'rgba(25, 118, 210, 0.05)', borderRadius: 3 }}>
+                      <Box display="flex" alignItems="center" gap={1} mb={2}>
+                        <Typography variant="h6" fontWeight={600} color="primary.main">
+                          Ключевой функционал
+                        </Typography>
+                        <Chip label="Важное" size="small" color="primary" />
+                      </Box>
+                      <Box display="flex" flexDirection="column" gap={1}>
+                        {data._original?.key_features?.map((item, idx) => {
+                          const issue = getIssueForItem('key_features', item.text);
+                          const isSelected = selectedItem?.field === 'key_features' && selectedItem?.text === item.text;
+                          return (
+                            <Box
+                              key={idx}
+                              onClick={() => setSelectedItem({ field: 'key_features', text: item.text, source: item.source, issue })}
+                              sx={{
+                                p: 1.5,
+                                borderRadius: 1.5,
+                                cursor: 'pointer',
+                                border: '1px solid',
+                                borderColor: isSelected ? 'primary.main' : (issue ? (issue.type === 'impossible' ? '#D32F2F' : issue.type === 'contradictory' ? '#0288D1' : '#ED6C02') : 'transparent'),
+                                bgcolor: isSelected ? 'rgba(25, 118, 210, 0.12)' : (issue ? (issue.type === 'impossible' ? '#FFEBEE' : issue.type === 'contradictory' ? '#E3F2FD' : '#FFF8E1') : 'white'),
+                                transition: 'all 0.2s ease',
+                                '&:hover': { bgcolor: isSelected ? undefined : 'rgba(25, 118, 210, 0.08)' }
+                              }}
+                            >
+                              <Box display="flex" alignItems="center" gap={1}>
+                                {issue && (
+                                  issue.type === 'impossible' ? <ErrorIcon fontSize="small" sx={{ color: '#D32F2F' }} /> :
+                                    issue.type === 'contradictory' ? <SyncProblem fontSize="small" sx={{ color: '#0288D1' }} /> :
+                                      <Warning fontSize="small" sx={{ color: '#ED6C02' }} />
+                                )}
+                                <Typography variant="body2">{item.text}</Typography>
+                              </Box>
+                            </Box>
+                          );
+                        })}
+                      </Box>
+                      <TextField
+                        fullWidth
+                        hiddenLabel
+                        multiline
+                        variant="filled"
+                        size="small"
+                        minRows={2}
+                        value={data.key_features || ''}
+                        onChange={(e) => setData({ ...data, key_features: e.target.value })}
+                        placeholder="Добавить/редактировать..."
+                        sx={{ mt: 2 }}
+                        InputProps={{ disableUnderline: true, sx: { borderRadius: 1.5, bgcolor: 'white', fontSize: '0.85rem' } }}
+                      />
+                    </Paper>
+
+                    {/* 6. ИНТЕГРАЦИИ — список кликабельных пунктов */}
+                    <Paper elevation={0} sx={{ gridColumn: '1 / -1', p: 3, bgcolor: 'white', borderRadius: 3, border: '1px solid', borderColor: 'divider' }}>
+                      <Typography variant="h6" fontWeight={600} gutterBottom>
+                        Интеграции
+                      </Typography>
+                      <Box display="flex" flexWrap="wrap" gap={1}>
+                        {data._original?.client_integrations?.map((item, idx) => {
+                          const issue = getIssueForItem('client_integrations', item.text);
+                          const isSelected = selectedItem?.field === 'client_integrations' && selectedItem?.text === item.text;
+                          return (
+                            <Chip
+                              key={idx}
+                              label={item.text}
+                              onClick={() => setSelectedItem({ field: 'client_integrations', text: item.text, source: item.source, issue })}
+                              icon={issue ? (
+                                issue.type === 'impossible' ? <ErrorIcon fontSize="small" /> :
+                                  issue.type === 'contradictory' ? <SyncProblem fontSize="small" /> :
+                                    <Warning fontSize="small" />
+                              ) : undefined}
+                              sx={{
+                                cursor: 'pointer',
+                                borderColor: isSelected ? 'primary.main' : undefined,
+                                bgcolor: issue ? (issue.type === 'impossible' ? '#FFEBEE' : issue.type === 'contradictory' ? '#E3F2FD' : '#FFF8E1') : undefined,
+                                '& .MuiChip-icon': {
+                                  color: issue?.type === 'impossible' ? '#D32F2F' : issue?.type === 'contradictory' ? '#0288D1' : '#ED6C02'
+                                }
+                              }}
+                              variant={isSelected ? 'filled' : 'outlined'}
+                              color={isSelected ? 'primary' : 'default'}
+                            />
+                          );
+                        })}
+                      </Box>
+                      <TextField
+                        fullWidth
+                        hiddenLabel
+                        multiline
+                        variant="filled"
+                        size="small"
+                        minRows={1}
+                        value={data.client_integrations || ''}
+                        onChange={(e) => setData({ ...data, client_integrations: e.target.value })}
+                        placeholder="Добавить интеграции..."
+                        sx={{ mt: 2 }}
+                        InputProps={{ disableUnderline: true, sx: { borderRadius: 1.5, bgcolor: 'grey.50', fontSize: '0.85rem' } }}
+                      />
+                    </Paper>
+
+                  </Box>
+                </Container>
               </Box>
+
+              {/* Правая часть: Боковая панель с цитатами из ТЗ */}
+              <Box
+                sx={{
+                  flex: 1,
+                  display: { xs: 'none', lg: 'block' },
+                  position: 'sticky',
+                  top: 80,
+                  alignSelf: 'flex-start',
+                  maxHeight: 'calc(100vh - 100px)',
+                  overflow: 'auto'
+                }}
+              >
+                <Paper
+                  elevation={0}
+                  sx={{
+                    p: 2.5,
+                    bgcolor: '#F5F5F5',
+                    borderRadius: 2,
+                    border: '1px solid',
+                    borderColor: 'divider'
+                  }}
+                >
+                  <Typography variant="subtitle2" color="text.secondary" sx={{ mb: 2, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                    Источник в ТЗ
+                  </Typography>
+
+                  {selectedItem && selectedItem.source ? (
+                    <Box>
+                      <Chip
+                        label={selectedItem.field?.replace(/_/g, ' ') || 'пункт'}
+                        size="small"
+                        color="primary"
+                        sx={{ mb: 1.5, textTransform: 'capitalize' }}
+                      />
+                      <Typography variant="body2" sx={{ mb: 1.5, fontWeight: 500 }}>
+                        {selectedItem.text}
+                      </Typography>
+                      <Divider sx={{ mb: 1.5 }} />
+                      <Paper
+                        elevation={0}
+                        sx={{
+                          p: 2,
+                          bgcolor: 'white',
+                          borderRadius: 1.5,
+                          border: '1px solid',
+                          borderColor: 'divider'
+                        }}
+                      >
+                        <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 1 }}>
+                          Цитата из ТЗ:
+                        </Typography>
+                        <Typography
+                          variant="body2"
+                          sx={{
+                            whiteSpace: 'pre-wrap',
+                            fontFamily: 'monospace',
+                            fontSize: '0.8rem',
+                            lineHeight: 1.6,
+                            color: 'text.primary',
+                            bgcolor: '#FFFDE7',
+                            p: 1.5,
+                            borderRadius: 1,
+                            borderLeft: '3px solid #FFC107'
+                          }}
+                        >
+                          "{selectedItem.source}"
+                        </Typography>
+                      </Paper>
+                      {/* Если есть issue для этого пункта */}
+                      {selectedItem.issue && (
+                        <Alert
+                          severity={selectedItem.issue.type === 'impossible' ? 'error' : selectedItem.issue.type === 'contradictory' ? 'info' : 'warning'}
+                          sx={{ mt: 2, borderRadius: 1.5 }}
+                        >
+                          <AlertTitle sx={{ fontWeight: 600 }}>
+                            {selectedItem.issue.type === 'impossible' ? 'Нереализуемое' :
+                              selectedItem.issue.type === 'contradictory' ? 'Противоречие' : 'Требует уточнения'}
+                          </AlertTitle>
+                          {selectedItem.issue.reason}
+                        </Alert>
+                      )}
+                    </Box>
+                  ) : (
+                    <Typography variant="body2" color="text.disabled">
+                      Кликните на пункт слева, чтобы увидеть исходный текст из ТЗ
+                    </Typography>
+                  )}
+                </Paper>
+              </Box>
+
             </Box>
 
-            <TableContainer sx={{ borderRadius: 2, border: '1px solid', borderColor: 'divider', mb: 4 }}>
-              <Table size="small">
-                <TableHead>
-                  <TableRow>
-                    <TableCell sx={{ minWidth: 150 }}>
-                      <strong>Этапы работ</strong>
-                    </TableCell>
-                    {Object.keys(roles).map(role => (
-                      <TableCell key={role} align="center" sx={{ minWidth: 120 }}>
-                        <Box display="flex" flexDirection="column" alignItems="center">
-                          <Box display="flex" alignItems="center" gap={0.5}>
-                            <Typography variant="body2" fontWeight={600}>{role}</Typography>
-                            <IconButton size="small" onClick={() => handleDeleteRole(role)} sx={{ color: 'text.secondary', p: 0.5 }}>
-                              <Delete fontSize="small" />
-                            </IconButton>
-                          </Box>
-                          <Typography variant="caption" color="text.secondary">
-                            {roles[role].toLocaleString()} ₽/ч
-                          </Typography>
-                        </Box>
-                      </TableCell>
-                    ))}
-                  </TableRow>
-                </TableHead>
-                <TableBody>
-                  {stages.map(stage => (
-                    <TableRow key={stage} hover>
-                      <TableCell component="th" scope="row" sx={{ fontWeight: 500 }}>
-                        <Box display="flex" alignItems="center" justifyContent="space-between">
-                          {stage}
-                          <IconButton size="small" onClick={() => handleDeleteStage(stage)} sx={{ color: 'text.secondary', opacity: 0.5, '&:hover': { opacity: 1 } }}>
-                            <Delete fontSize="small" />
-                          </IconButton>
-                        </Box>
+            {/* ПРОДОЛЖАЕМ ОСТАЛЬНОЙ UI В ОБЫЧНОМ КОНТЕЙНЕРЕ ИЛИ ТОЖЕ ВНУТРИ? 
+                Таблица сметы широкая, лучше оставить её как есть или тоже вписать в 900px?
+                В запросе: "Ограничь ширину контента... для центрального блока".
+                Таблицу можно оставить широкой, но для консистентности лучше тоже 900px.
+            */}
+            <Container maxWidth="md" disableGutters sx={{ mb: 4 }}>
+
+              {/* ТАБЛИЦА СМЕТЫ */}
+              <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
+                <Typography variant="h6" fontWeight={600}>Матрица трудозатрат</Typography>
+                <Box>
+                  <Button
+                    startIcon={<Add />}
+                    onClick={() => setOpenStageDialog(true)}
+                    sx={{ color: 'primary.main' }}
+                  >
+                    Этап
+                  </Button>
+                  <Button
+                    startIcon={<Add />}
+                    onClick={() => setOpenRoleDialog(true)}
+                    sx={{ color: 'primary.main' }}
+                  >
+                    Роль
+                  </Button>
+                </Box>
+              </Box>
+
+              <TableContainer sx={{ borderRadius: 2, border: '1px solid', borderColor: 'divider', mb: 4 }}>
+                <Table size="small">
+                  <TableHead>
+                    <TableRow>
+                      <TableCell sx={{ minWidth: 150 }}>
+                        <strong>Этапы работ</strong>
                       </TableCell>
                       {Object.keys(roles).map(role => (
-                        <TableCell key={role} align="center">
-                          <TextField
-                            type="number"
-                            variant="standard"
-                            InputProps={{
-                              disableUnderline: true,
-                              inputProps: { style: { textAlign: 'center' }, min: 0 }
-                            }}
-                            sx={{
-                              width: 60,
-                              '& input': { p: 1, borderRadius: 1, bgcolor: 'background.default' }
-                            }}
-                            value={budgetMatrix[stage]?.[role] || 0}
-                            onChange={(e) => handleHourChange(stage, role, e.target.value)}
-                          />
+                        <TableCell key={role} align="center" sx={{ minWidth: 120 }}>
+                          <Box display="flex" flexDirection="column" alignItems="center">
+                            <Box display="flex" alignItems="center" gap={0.5}>
+                              <Typography variant="body2" fontWeight={600}>{role}</Typography>
+                              <IconButton size="small" onClick={() => handleDeleteRole(role)} sx={{ color: 'text.secondary', p: 0.5 }}>
+                                <Delete fontSize="small" />
+                              </IconButton>
+                            </Box>
+                            <TextField
+                              type="number"
+                              variant="standard"
+                              size="small"
+                              value={roles[role]}
+                              onChange={(e) => setRoles(prev => ({ ...prev, [role]: parseInt(e.target.value) || 0 }))}
+                              InputProps={{
+                                disableUnderline: true,
+                                endAdornment: <Typography variant="caption" color="text.secondary">₽/ч</Typography>,
+                                inputProps: { style: { textAlign: 'center', width: 50 }, min: 0 }
+                              }}
+                              sx={{ '& input': { p: 0.5, bgcolor: 'grey.50', borderRadius: 0.5 } }}
+                            />
+                          </Box>
                         </TableCell>
                       ))}
                     </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
-            </TableContainer>
+                  </TableHead>
+                  <TableBody>
+                    {stages.map(stage => (
+                      <TableRow key={stage} hover>
+                        <TableCell component="th" scope="row" sx={{ fontWeight: 500 }}>
+                          <Box display="flex" alignItems="center" justifyContent="space-between">
+                            {stage}
+                            <IconButton size="small" onClick={() => handleDeleteStage(stage)} sx={{ color: 'text.secondary', opacity: 0.5, '&:hover': { opacity: 1 } }}>
+                              <Delete fontSize="small" />
+                            </IconButton>
+                          </Box>
+                        </TableCell>
+                        {Object.keys(roles).map(role => {
+                          const isModified = userModified[stage]?.[role];
+                          const currentValue = budgetMatrix[stage]?.[role] || 0;
 
-            {/* Итоговая смета */}
-            <Paper
-              variant="outlined"
-              sx={{
-                p: 3,
-                bgcolor: '#FFF0E0',
-                borderRadius: 3,
-                borderColor: 'primary.light',
-                display: 'flex',
-                justifyContent: 'space-between',
-                alignItems: 'center',
-                flexWrap: 'wrap',
-                gap: 2,
-              }}
-            >
-              <Box>
-                <Typography variant="h6" color="text.primary">
-                  Итоговая смета:
-                </Typography>
-                <Typography variant="h4" color="primary.main" fontWeight="bold">
-                  {calculateTotal().toLocaleString('ru-RU')} ₽
-                </Typography>
-              </Box>
-              <Button
-                variant="contained"
-                size="large"
-                onClick={handleApprove}
-                startIcon={<CheckCircle />}
-                sx={{ px: 5, py: 1.5 }}
+                          return (
+                            <TableCell key={role} align="center">
+                              <TextField
+                                type="number"
+                                variant="standard"
+                                InputProps={{
+                                  disableUnderline: true,
+                                  inputProps: {
+                                    style: {
+                                      textAlign: 'center',
+                                      color: isModified ? '#1976D2' : '#9E9E9E',
+                                      fontStyle: isModified ? 'normal' : 'italic',
+                                      fontWeight: isModified ? 600 : 400
+                                    },
+                                    min: 0
+                                  }
+                                }}
+                                sx={{
+                                  width: 60,
+                                  '& input': {
+                                    p: 1,
+                                    borderRadius: 1,
+                                    bgcolor: isModified ? 'rgba(25, 118, 210, 0.08)' : 'background.default',
+                                    transition: 'all 0.2s ease'
+                                  }
+                                }}
+                                value={currentValue}
+                                onChange={(e) => handleHourChange(stage, role, e.target.value)}
+                              />
+                            </TableCell>
+                          );
+                        })}
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </TableContainer>
+
+              {/* Итоговая смета */}
+              <Paper
+                variant="outlined"
+                sx={{
+                  p: 3,
+                  bgcolor: '#FFF0E0',
+                  borderRadius: 3,
+                  borderColor: 'primary.light',
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  flexWrap: 'wrap',
+                  gap: 2,
+                }}
               >
-                Утвердить КП
-              </Button>
-            </Paper>
-          </Paper>
-        )}
+                <Box>
+                  <Typography variant="h6" color="text.primary">
+                    Итоговая смета:
+                  </Typography>
+                  <Typography variant="h4" color="primary.main" fontWeight="bold">
+                    {calculateTotal().toLocaleString('ru-RU')} ₽
+                  </Typography>
+                </Box>
+                <Button
+                  variant="contained"
+                  size="large"
+                  onClick={handleApprove}
+                  startIcon={<CheckCircle />}
+                  sx={{ px: 5, py: 1.5 }}
+                >
+                </Button>
+              </Paper>
+            </Container>
+          </Paper >
+        )
+        }
 
         {/* БЛОК 4: РЕЗУЛЬТАТ */}
-        {status === "COMPLETED" && (
-          <Paper elevation={0} sx={{ p: 4, bgcolor: '#E8F5E9', borderRadius: 4 }}>
-            <Box display="flex" alignItems="center" mb={3}>
-              <CheckCircle color="success" sx={{ fontSize: 48, mr: 2 }} />
-              <Typography variant="h5" fontWeight={600}>
-                КП Успешно сгенерировано!
-              </Typography>
-            </Box>
+        {
+          status === "COMPLETED" && (
+            <Paper elevation={0} sx={{ p: 4, bgcolor: '#E8F5E9', borderRadius: 4 }}>
+              <Box display="flex" alignItems="center" mb={3}>
+                <CheckCircle color="success" sx={{ fontSize: 48, mr: 2 }} />
+                <Typography variant="h5" fontWeight={600}>
+                  КП Успешно сгенерировано!
+                </Typography>
+              </Box>
 
-            <Paper
-              elevation={0}
-              variant="outlined"
-              sx={{
-                p: 3,
-                borderRadius: 2,
-                bgcolor: 'white',
-              }}
-            >
-              <TextField
-                fullWidth
-                multiline
-                minRows={10}
-                maxRows={30}
+              <Paper
+                elevation={0}
                 variant="outlined"
-                value={finalDoc || ''}
-                onChange={(e) => setFinalDoc(e.target.value)}
-                sx={{ mb: 2 }}
-              />
+                sx={{
+                  p: 3,
+                  borderRadius: 2,
+                  bgcolor: 'white',
+                }}
+              >
+                <TextField
+                  fullWidth
+                  multiline
+                  minRows={10}
+                  maxRows={30}
+                  variant="outlined"
+                  value={finalDoc || ''}
+                  onChange={(e) => setFinalDoc(e.target.value)}
+                  sx={{ mb: 2 }}
+                />
+              </Paper>
+
+              <Box display="flex" gap={2} mt={3}>
+                <Button
+                  variant="contained"
+                  size="large"
+                  startIcon={<GetApp />}
+                  onClick={handleDownload}
+                  sx={{ px: 4 }}
+                >
+                  Скачать .docx
+                </Button>
+
+                <Button
+                  variant="outlined"
+                  size="large"
+                  startIcon={<Refresh />}
+                  onClick={() => window.location.reload()}
+                >
+                  Новый расчет
+                </Button>
+              </Box>
             </Paper>
-
-            <Box display="flex" gap={2} mt={3}>
-              <Button
-                variant="contained"
-                size="large"
-                startIcon={<GetApp />}
-                onClick={handleDownload}
-                sx={{ px: 4 }}
-              >
-                Скачать .docx
-              </Button>
-
-              <Button
-                variant="outlined"
-                size="large"
-                startIcon={<Refresh />}
-                onClick={() => window.location.reload()}
-              >
-                Новый расчет
-              </Button>
-            </Box>
-          </Paper>
-        )}
-      </Container>
+          )
+        }
+      </Container >
 
       {/* МОДАЛКИ ДЛЯ ДОБАВЛЕНИЯ */}
-      <Dialog open={openRoleDialog} onClose={() => setOpenRoleDialog(false)} maxWidth="xs" fullWidth>
+      < Dialog open={openRoleDialog} onClose={() => setOpenRoleDialog(false)} maxWidth="xs" fullWidth >
         <DialogTitle sx={{ fontWeight: 600 }}>Добавить роль</DialogTitle>
         <DialogContent sx={{ pt: 2 }}>
           <TextField
@@ -654,7 +1163,7 @@ export default function AgentKP() {
           <Button onClick={() => setOpenRoleDialog(false)}>Отмена</Button>
           <Button onClick={handleAddRole} variant="contained">Добавить</Button>
         </DialogActions>
-      </Dialog>
+      </Dialog >
 
       <Dialog open={openStageDialog} onClose={() => setOpenStageDialog(false)} maxWidth="xs" fullWidth>
         <DialogTitle sx={{ fontWeight: 600 }}>Добавить этап</DialogTitle>
@@ -673,6 +1182,6 @@ export default function AgentKP() {
           <Button onClick={handleAddStage} variant="contained">Добавить</Button>
         </DialogActions>
       </Dialog>
-    </Box>
+    </Box >
   );
 }
