@@ -65,11 +65,25 @@ export default function AgentKP() {
   const [selectedItem, setSelectedItem] = useState(null);  // {field, text, source} - выбранный пункт
   const [userModified, setUserModified] = useState({});  // {этап: {роль: true/false}}
 
-  // Хелпер: найти issue для пункта
+  // Хелпер: найти issue для пункта (Нечеткое сравнение)
   const getIssueForItem = (fieldName, itemText) => {
-    return requirementIssues.find(
-      issue => issue.field === fieldName && issue.item_text === itemText
-    );
+    if (!itemText) return null;
+    const cleanItem = itemText.toLowerCase().trim();
+
+    return requirementIssues.find(issue => {
+      if (issue.field !== fieldName) return false;
+      if (!issue.item_text) return false;
+
+      const cleanIssueText = issue.item_text.toLowerCase().trim();
+      // 1. Точное совпадение (с очисткой)
+      if (cleanItem === cleanIssueText) return true;
+      // 2. Частичное совпадение (если LLM сократил или изменил пару слов)
+      // Проверяем, содержится ли одна строка в другой (достаточно длинная)
+      if (cleanItem.length > 10 && cleanIssueText.length > 10) {
+        return cleanItem.includes(cleanIssueText) || cleanIssueText.includes(cleanItem);
+      }
+      return false;
+    });
   };
 
   useEffect(() => {
@@ -134,14 +148,51 @@ export default function AgentKP() {
             return arr.map(item => typeof item === 'object' ? item.text : item);
           };
 
+          // Извлечение текста из категоризированной структуры key_features
+          const extractCategorizedFeatures = (obj) => {
+            if (!obj || typeof obj !== 'object') return '';
+            if (Array.isArray(obj)) {
+              // Fallback для старой структуры (массив)
+              return extractTextArray(obj).join('\n');
+            }
+            // Новая структура с категориями
+            const allTexts = [];
+            Object.values(obj).forEach(categoryArr => {
+              if (Array.isArray(categoryArr)) {
+                categoryArr.forEach(item => {
+                  allTexts.push(typeof item === 'object' ? item.text : item);
+                });
+              }
+            });
+            return allTexts.join('\n');
+          };
+
+          // Преобразуем категоризированную структуру в плоский массив для отображения
+          const flattenCategorizedFeatures = (obj) => {
+            if (!obj || typeof obj !== 'object') return [];
+            if (Array.isArray(obj)) return obj; // Fallback для старой структуры
+            const allItems = [];
+            Object.entries(obj).forEach(([category, items]) => {
+              if (Array.isArray(items)) {
+                items.forEach(item => {
+                  allItems.push({ ...item, category });
+                });
+              }
+            });
+            return allItems;
+          };
+
           const formattedData = {
             ...raw,
             business_goals: extractTextArray(raw.business_goals).join('\n'),
-            key_features: extractTextArray(raw.key_features).join('\n'),
+            key_features: extractCategorizedFeatures(raw.key_features),
             tech_stack: extractTextArray(raw.tech_stack).join('\n'),
             client_integrations: extractTextArray(raw.client_integrations).join('\n'),
             // Сохраняем оригинальные массивы для показа цитат
-            _original: raw
+            _original: {
+              ...raw,
+              key_features_flat: flattenCategorizedFeatures(raw.key_features)
+            }
           };
           setData(formattedData);
 
@@ -157,7 +208,17 @@ export default function AgentKP() {
 
           setStages(aiStages);
           // Инициализируем роли с дефолтными ставками
-          const defaultRates = { "Менеджер": 2500, "ML-Инженер": 3500, "Frontend": 3000, "Backend": 3000, "Дизайнер": 2800, "QA": 2200, "DevOps": 3200 };
+          const defaultRates = {
+            "Менеджер проекта": 2500,
+            "Системный аналитик": 2800,
+            "Дизайнер UI/UX": 2800,
+            "Frontend-разработчик": 3000,
+            "Backend-разработчик": 3000,
+            "Fullstack-разработчик": 3200,
+            "ML-инженер": 3500,
+            "DevOps-инженер": 3200,
+            "QA-инженер": 2200,
+          };
           const rolesWithRates = {};
           aiRoles.forEach(r => {
             rolesWithRates[r] = defaultRates[r] || 2500; // дефолтная ставка если роль неизвестна
@@ -190,7 +251,12 @@ export default function AgentKP() {
           clearInterval(interval);
         }
       } catch (err) {
-        console.error("Ошибка опроса:", err);
+        // При 404 (workflow не найден) останавливаем опрос
+        if (err.response?.status === 404) {
+          clearInterval(interval);
+        } else {
+          console.error("Ошибка опроса:", err);
+        }
       }
     }, 2000); // Спрашиваем каждые 2 секунды
 
@@ -577,7 +643,8 @@ export default function AgentKP() {
                         borderColor: selectedItem?.field === 'client_name' ? 'primary.main' : 'divider',
                         cursor: 'pointer',
                         transition: 'all 0.2s ease',
-                        '&:hover': { borderColor: 'primary.light', bgcolor: 'rgba(25, 118, 210, 0.04)' }
+                        '&:hover': { borderColor: 'primary.light', bgcolor: 'rgba(25, 118, 210, 0.04)' },
+                        alignSelf: 'start'
                       }}
                     >
                       <Typography variant="subtitle2" color="text.secondary" sx={{ mb: 1, pl: 0.5, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
@@ -594,15 +661,18 @@ export default function AgentKP() {
                       />
                     </Paper>
 
-                    {/* 2. СТЕК ТЕХНОЛОГИЙ */}
+                    {/* 2. СТЕК ТЕХНОЛОГИЙ (Span 2 rows on Desktop) */}
                     <Paper
                       elevation={0}
                       sx={{
+                        gridRow: { md: 'span 2' },
                         p: 2,
                         bgcolor: !data.tech_stack ? '#FFF3E0' : 'white',
                         borderRadius: 2,
                         border: '1px solid',
-                        borderColor: !data.tech_stack ? '#FFCC80' : 'divider'
+                        borderColor: !data.tech_stack ? '#FFCC80' : 'divider',
+                        display: 'flex',
+                        flexDirection: 'column'
                       }}
                     >
                       <Box display="flex" justifyContent="space-between" alignItems="center" mb={1}>
@@ -615,7 +685,7 @@ export default function AgentKP() {
                       </Box>
                       {/* Кликабельные чипы для стека */}
                       {data._original?.tech_stack?.length > 0 && (
-                        <Box display="flex" flexWrap="wrap" gap={0.5} mb={1.5}>
+                        <Box display="flex" flexWrap="wrap" gap={0.5} mb={1.5} sx={{ flex: 1, alignContent: 'flex-start' }}>
                           {data._original.tech_stack.map((item, idx) => {
                             const isSelected = selectedItem?.field === 'tech_stack' && selectedItem?.text === item.text;
                             return (
@@ -637,12 +707,39 @@ export default function AgentKP() {
                         hiddenLabel
                         variant="filled"
                         size="small"
+                        multiline
+                        minRows={3}
                         value={data.tech_stack || ''}
                         onChange={(e) => setData({ ...data, tech_stack: e.target.value })}
                         placeholder="Добавить технологии..."
                         helperText={!data.tech_stack ? "Если не указано в ТЗ, добавьте вручную" : ""}
-                        InputProps={{ disableUnderline: true, sx: { borderRadius: 1.5, bgcolor: !data.tech_stack ? 'white' : 'grey.50', fontSize: '0.85rem' } }}
+                        InputProps={{ disableUnderline: true, sx: { borderRadius: 1.5, bgcolor: !data.tech_stack ? 'white' : 'grey.50', fontSize: '0.85rem', alignItems: 'flex-start' } }}
                         FormHelperTextProps={{ sx: { ml: 0, mt: 1, color: 'text.secondary' } }}
+                      />
+                    </Paper>
+
+                    {/* 2.5. ТИП ПРОЕКТА (Col 1, Row 2) */}
+                    <Paper
+                      elevation={0}
+                      sx={{
+                        p: 2,
+                        bgcolor: 'white',
+                        borderRadius: 2,
+                        border: '1px solid',
+                        borderColor: 'divider',
+                        alignSelf: 'start'
+                      }}
+                    >
+                      <Typography variant="subtitle2" color="text.secondary" sx={{ mb: 1, pl: 0.5, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                        Тип проекта
+                      </Typography>
+                      <TextField
+                        fullWidth
+                        hiddenLabel
+                        variant="filled"
+                        value={data.project_type || ''}
+                        onChange={(e) => setData({ ...data, project_type: e.target.value })}
+                        InputProps={{ disableUnderline: true, sx: { borderRadius: 1.5, bgcolor: 'grey.50' } }}
                       />
                     </Paper>
 
@@ -730,45 +827,173 @@ export default function AgentKP() {
                       />
                     </Paper>
 
-                    {/* 5. КЛЮЧЕВОЙ ФУНКЦИОНАЛ — список кликабельных пунктов */}
+                    {/* 5. КЛЮЧЕВОЙ ФУНКЦИОНАЛ — список кликабельных пунктов с категориями */}
                     <Paper elevation={0} sx={{ gridColumn: '1 / -1', p: 3, bgcolor: 'rgba(25, 118, 210, 0.05)', borderRadius: 3 }}>
                       <Box display="flex" alignItems="center" gap={1} mb={2}>
                         <Typography variant="h6" fontWeight={600} color="primary.main">
                           Ключевой функционал
                         </Typography>
-                        <Chip label="Важное" size="small" color="primary" />
+                        <Chip
+                          label={`${data._original?.key_features_flat?.length || 0} требований`}
+                          size="small"
+                          color="primary"
+                        />
                       </Box>
-                      <Box display="flex" flexDirection="column" gap={1}>
-                        {data._original?.key_features?.map((item, idx) => {
-                          const issue = getIssueForItem('key_features', item.text);
-                          const isSelected = selectedItem?.field === 'key_features' && selectedItem?.text === item.text;
+
+                      {/* Категории */}
+                      {(() => {
+                        const features = data._original?.key_features_flat || [];
+                        const categories = [...new Set(features.map(f => f.category).filter(Boolean))];
+                        // Material 3 стиль категорий с иконками и цветами
+                        const categoryConfig = {
+                          modules: { label: 'Модули', color: '#6750A4', bgColor: 'rgba(103, 80, 164, 0.08)' },
+                          screens: { label: 'Экраны', color: '#0061A4', bgColor: 'rgba(0, 97, 164, 0.08)' },
+                          reports: { label: 'Отчёты', color: '#006E1C', bgColor: 'rgba(0, 110, 28, 0.08)' },
+                          integrations: { label: 'Интеграции', color: '#BA1A1A', bgColor: 'rgba(186, 26, 26, 0.08)' },
+                          nfr: { label: 'Нефункциональные требования', color: '#5D5F5F', bgColor: 'rgba(93, 95, 95, 0.08)' }
+                        };
+
+                        if (categories.length === 0) {
+                          // Fallback: показываем как раньше без категорий
                           return (
-                            <Box
-                              key={idx}
-                              onClick={() => setSelectedItem({ field: 'key_features', text: item.text, source: item.source, issue })}
-                              sx={{
-                                p: 1.5,
-                                borderRadius: 1.5,
-                                cursor: 'pointer',
-                                border: '1px solid',
-                                borderColor: isSelected ? 'primary.main' : (issue ? (issue.type === 'impossible' ? '#D32F2F' : issue.type === 'contradictory' ? '#0288D1' : '#ED6C02') : 'transparent'),
-                                bgcolor: isSelected ? 'rgba(25, 118, 210, 0.12)' : (issue ? (issue.type === 'impossible' ? '#FFEBEE' : issue.type === 'contradictory' ? '#E3F2FD' : '#FFF8E1') : 'white'),
-                                transition: 'all 0.2s ease',
-                                '&:hover': { bgcolor: isSelected ? undefined : 'rgba(25, 118, 210, 0.08)' }
-                              }}
-                            >
-                              <Box display="flex" alignItems="center" gap={1}>
-                                {issue && (
-                                  issue.type === 'impossible' ? <ErrorIcon fontSize="small" sx={{ color: '#D32F2F' }} /> :
-                                    issue.type === 'contradictory' ? <SyncProblem fontSize="small" sx={{ color: '#0288D1' }} /> :
-                                      <Warning fontSize="small" sx={{ color: '#ED6C02' }} />
-                                )}
-                                <Typography variant="body2">{item.text}</Typography>
+                            <Box display="flex" flexDirection="column" gap={1}>
+                              {features.map((item, idx) => {
+                                const issue = getIssueForItem('key_features', item.text);
+                                const isSelected = selectedItem?.field === 'key_features' && selectedItem?.text === item.text;
+                                return (
+                                  <Box
+                                    key={idx}
+                                    onClick={() => setSelectedItem({ field: 'key_features', text: item.text, source: item.source, issue })}
+                                    sx={{
+                                      p: 1.5,
+                                      borderRadius: 1.5,
+                                      cursor: 'pointer',
+                                      border: '1px solid',
+                                      borderColor: isSelected ? 'primary.main' : (issue ? '#ED6C02' : 'transparent'),
+                                      bgcolor: isSelected ? 'rgba(25, 118, 210, 0.12)' : (issue ? '#FFF8E1' : 'white'),
+                                      transition: 'all 0.2s ease',
+                                      '&:hover': { bgcolor: isSelected ? undefined : 'rgba(25, 118, 210, 0.08)' }
+                                    }}
+                                  >
+                                    <Box display="flex" alignItems="center" justifyContent="space-between" gap={1}>
+                                      <Box display="flex" alignItems="center" gap={1} flex={1}>
+                                        {issue && <Warning fontSize="small" sx={{ color: '#ED6C02' }} />}
+                                        <Typography variant="body2">{item.text}</Typography>
+                                      </Box>
+                                      {item.estimated_hours && (
+                                        <Chip size="small" label={`${item.estimated_hours} ч`}
+                                          sx={{ bgcolor: 'rgba(25, 118, 210, 0.1)', color: 'primary.main', fontWeight: 600, fontSize: '0.7rem', height: 24, minWidth: 48 }} />
+                                      )}
+                                    </Box>
+                                  </Box>
+                                );
+                              })}
+                            </Box>
+                          );
+                        }
+
+                        // Показываем по категориям с Material 3 стилем
+                        return categories.map(cat => {
+                          const catFeatures = features.filter(f => f.category === cat);
+                          if (catFeatures.length === 0) return null;
+                          const config = categoryConfig[cat] || { label: cat, color: '#1976D2', bgColor: 'rgba(25, 118, 210, 0.08)' };
+
+                          return (
+                            <Box key={cat} sx={{ mb: 2.5 }}>
+                              {/* Material 3 категория header */}
+                              <Box
+                                sx={{
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  gap: 1.5,
+                                  mb: 1.5,
+                                  pb: 1,
+                                  borderBottom: `2px solid ${config.color}20`
+                                }}
+                              >
+                                <Box
+                                  sx={{
+                                    width: 4,
+                                    height: 20,
+                                    borderRadius: 2,
+                                    bgcolor: config.color
+                                  }}
+                                />
+                                <Typography
+                                  variant="subtitle2"
+                                  sx={{
+                                    color: config.color,
+                                    fontWeight: 600,
+                                    letterSpacing: '0.02em'
+                                  }}
+                                >
+                                  {config.label}
+                                </Typography>
+                                <Chip
+                                  label={catFeatures.length}
+                                  size="small"
+                                  sx={{
+                                    height: 22,
+                                    fontSize: '0.75rem',
+                                    fontWeight: 600,
+                                    bgcolor: config.bgColor,
+                                    color: config.color,
+                                    border: 'none'
+                                  }}
+                                />
+                              </Box>
+                              <Box display="flex" flexDirection="column" gap={0.75}>
+                                {catFeatures.map((item, idx) => {
+                                  const issue = getIssueForItem('key_features', item.text);
+                                  const isSelected = selectedItem?.field === 'key_features' && selectedItem?.text === item.text;
+                                  return (
+                                    <Box
+                                      key={idx}
+                                      onClick={() => setSelectedItem({ field: 'key_features', text: item.text, source: item.source, issue, category: cat })}
+                                      sx={{
+                                        p: 1.25,
+                                        borderRadius: 1.5,
+                                        cursor: 'pointer',
+                                        border: '1px solid',
+                                        borderColor: isSelected ? 'primary.main' : (issue ? (issue.type === 'impossible' ? '#D32F2F' : issue.type === 'contradictory' ? '#0288D1' : '#ED6C02') : 'transparent'),
+                                        bgcolor: isSelected ? 'rgba(25, 118, 210, 0.12)' : (issue ? (issue.type === 'impossible' ? '#FFEBEE' : issue.type === 'contradictory' ? '#E3F2FD' : '#FFF8E1') : 'white'),
+                                        transition: 'all 0.2s ease',
+                                        '&:hover': { bgcolor: isSelected ? undefined : 'rgba(25, 118, 210, 0.08)' }
+                                      }}
+                                    >
+                                      <Box display="flex" alignItems="center" justifyContent="space-between" gap={1}>
+                                        <Box display="flex" alignItems="center" gap={1} flex={1}>
+                                          {issue && (
+                                            issue.type === 'impossible' ? <ErrorIcon fontSize="small" sx={{ color: '#D32F2F' }} /> :
+                                              issue.type === 'contradictory' ? <SyncProblem fontSize="small" sx={{ color: '#0288D1' }} /> :
+                                                <Warning fontSize="small" sx={{ color: '#ED6C02' }} />
+                                          )}
+                                          <Typography variant="body2">{item.text}</Typography>
+                                        </Box>
+                                        {item.estimated_hours && (
+                                          <Chip
+                                            size="small"
+                                            label={`${item.estimated_hours} ч`}
+                                            sx={{
+                                              bgcolor: 'rgba(25, 118, 210, 0.1)',
+                                              color: 'primary.main',
+                                              fontWeight: 600,
+                                              fontSize: '0.7rem',
+                                              height: 24,
+                                              minWidth: 48
+                                            }}
+                                          />
+                                        )}
+                                      </Box>
+                                    </Box>
+                                  );
+                                })}
                               </Box>
                             </Box>
                           );
-                        })}
-                      </Box>
+                        });
+                      })()}
+
                       <TextField
                         fullWidth
                         hiddenLabel
@@ -776,7 +1001,7 @@ export default function AgentKP() {
                         variant="filled"
                         size="small"
                         minRows={2}
-                        value={data.key_features || ''}
+                        value={typeof data.key_features === 'string' ? data.key_features : ''}
                         onChange={(e) => setData({ ...data, key_features: e.target.value })}
                         placeholder="Добавить/редактировать..."
                         sx={{ mt: 2 }}
@@ -845,7 +1070,9 @@ export default function AgentKP() {
                   top: 80,
                   alignSelf: 'flex-start',
                   maxHeight: 'calc(100vh - 100px)',
-                  overflow: 'auto'
+                  overflow: 'auto',
+                  minWidth: 350,
+                  zIndex: 10
                 }}
               >
                 <Paper
@@ -980,10 +1207,29 @@ export default function AgentKP() {
                               onChange={(e) => setRoles(prev => ({ ...prev, [role]: parseInt(e.target.value) || 0 }))}
                               InputProps={{
                                 disableUnderline: true,
-                                endAdornment: <Typography variant="caption" color="text.secondary">₽/ч</Typography>,
-                                inputProps: { style: { textAlign: 'center', width: 50 }, min: 0 }
+                                endAdornment: <Typography variant="caption" color="text.disabled" sx={{ fontSize: '0.65rem', ml: 0.25 }}>₽/ч</Typography>,
+                                inputProps: {
+                                  style: {
+                                    textAlign: 'center',
+                                    width: 40,
+                                    fontSize: '0.75rem',
+                                    padding: '2px 4px'
+                                  },
+                                  min: 0
+                                }
                               }}
-                              sx={{ '& input': { p: 0.5, bgcolor: 'grey.50', borderRadius: 0.5 } }}
+                              sx={{
+                                '& input': {
+                                  p: 0.25,
+                                  bgcolor: 'grey.100',
+                                  borderRadius: 1,
+                                  '&:hover': { bgcolor: 'grey.200' },
+                                  '&:focus': { bgcolor: 'primary.50', outline: '1px solid', outlineColor: 'primary.light' }
+                                },
+                                '& .MuiInputBase-root': {
+                                  fontSize: '0.75rem'
+                                }
+                              }}
                             />
                           </Box>
                         </TableCell>

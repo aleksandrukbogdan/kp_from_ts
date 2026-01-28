@@ -135,109 +135,210 @@ async def save_budget_stub(data: dict) -> str:
 
 @activity.defn
 async def analyze_tz_activity(text: str) -> dict:
-    """Анализ ТЗ и извлечение JSON с детальными цитатами для каждого пункта"""
-    # Ограничение контекста для модели (настраивается через TZ_MAX_CHARS)
-    MAX_CHARS = int(os.getenv("TZ_MAX_CHARS", "90000"))
+    """Анализ ТЗ: Двухэтапный подход для стабильности (Extraction -> Analysis)"""
+    MAX_CHARS = int(os.getenv("TZ_MAX_CHARS", "180000"))
     truncated_text = text[:MAX_CHARS]
-    if len(text) > MAX_CHARS:
-        print(f"Warning: Текст обрезан с {len(text)} до {MAX_CHARS} символов для LLM.")
-    
-    prompt = f"""
-Извлеки данные из технического задания в формате JSON:
-
-1. "client_name": Название компании.
-
-2. "business_goals": Массив объектов. Каждый объект:
-   {{"text": "формулировка цели", "source": "точная цитата из ТЗ, откуда это взято"}}
-
-3. "project_essence": Краткая суть проекта в 1-2 предложениях.
-   
-4. "key_features": Массив объектов. Каждый объект:
-   {{"text": "название функции/требования", "source": "точная цитата из ТЗ"}}
-
-5. "tech_stack": Массив объектов (если указан в ТЗ). Каждый объект:
-   {{"text": "технология", "source": "цитата из ТЗ"}}
-   Если не указан — пустой массив [].
-
-6. "client_integrations": Массив объектов. Каждый объект:
-   {{"text": "название интеграции", "source": "цитата из ТЗ"}}
-   Если нет — пустой массив [].
-
-7. "project_type": Тип проекта (Web, Mobile, ML, Design).
-
-8. "requirement_issues": Массив проблемных требований. Каждый объект:
-   - "type": один из ["questionable", "impossible", "contradictory"]
-   - "field": к какому полю относится ("key_features", "business_goals", "client_integrations" и т.д.)
-   - "item_text": текст проблемного пункта (должен совпадать с text в соответствующем поле)
-   - "source": цитата из ТЗ
-   - "reason": причина, почему это проблема
-   
-   Типы:
-   - "questionable" — нечёткие требования без конкретики
-   - "impossible" — технически нереализуемые требования  
-   - "contradictory" — требования, противоречащие другим пунктам ТЗ
-   
-   Если проблем нет — пустой массив [].
-
-9. "source_excerpts": Объект с общими цитатами для полей, которые не являются массивами:
-   - "client_name": цитата, откуда взято название компании
-   - "project_essence": цитата с описанием сути проекта
-
-10. "suggested_stages": Массив рекомендуемых этапов работ для этого проекта.
-    Например: ["Аналитика", "Дизайн", "Разработка MVP", "Тестирование", "Запуск"]
-
-11. "suggested_roles": Массив рекомендуемых ролей для команды.
-    Например: ["Менеджер", "Дизайнер", "Frontend", "Backend", "ML-инженер", "QA"]
-
-ВАЖНО: Каждая цитата в "source" должна быть ТОЧНЫМ фрагментом текста из ТЗ (до 300 символов).
-
-Верни ТОЛЬКО валидный JSON.
-
-Текст ТЗ:
-{truncated_text}
-    """
     
     client = OpenAI(
         base_url=os.getenv("QWEN_BASE_URL"),
         api_key=os.getenv("QWEN_API_KEY"),
     )
+
+    # --- ЭТАП 1: ИЗВЛЕЧЕНИЕ ФАКТОВ (EXTRACTION PHASE) ---
+    # Задача: Просто найти и процитировать, ничего не придумывать.
+    # Мы просим модель вернуть JSON с цитатами.
+    prompt_extract = f"""
+ВАЖНО: Все ответы ДОЛЖНЫ быть на РУССКОМ языке. Не используй английский.
+
+Проанализируй текст технического задания и извлеки фактические данные в формат JSON.
+Ты можешь систематизировать информацию, но НЕ придумывай ничего, используй только то, что есть в тексте.
+
+1. "client_name": Название компании клиента.
+
+2. "project_essence": Суть проекта в 1-2 предложениях.
+
+3. "project_type": Тип проекта (Web, Mobile, ML, Design, Other).
+
+4. "business_goals": Массив целей ( [{{"text": "...", "source": "..."}}] ).
+
+5. "tech_stack": Технологии, НА КОТОРЫХ будет написан продукт.
+   Формат: [{{"text": "...", "source": "..."}}]
+   ВКЛЮЧАЙ: Python, React, Vue, PostgreSQL, Docker, FastAPI, Node.js, Redis, Kubernetes
+   НЕ ВКЛЮЧАЙ: 1C, SAP, Bitrix24, CRM клиента, внешние API, сторонние сервисы
+   ВАЖНО: Исключи словари, глоссарии и определения терминов.
+
+6. "client_integrations": Внешние системы, С КОТОРЫМИ продукт будет интегрироваться.
+   Формат: [{{"text": "...", "source": "..."}}]
+   ВКЛЮЧАЙ: 1C, SAP, Bitrix24, API банка, Telegram-бот, СДЭК, почтовые сервисы, платежные системы
+   НЕ ВКЛЮЧАЙ: React, PostgreSQL, Docker (это стек разработки, а не интеграции)
+
+7. "key_features": Объект с категориями функциональных требований.
+   ВАЖНО: Извлеки ВСЕ требования из текста. Лучше включить лишнее, чем пропустить важное.
+   ВАЖНО: Перечитай текст дважды — проверь таблицы, списки, приложения.
+   Целевое количество: 15-50 пунктов суммарно по всем категориям.
+   
+   Формат:
+   {{
+     "modules": [{{"text": "...", "source": "..."}}],       // Логические модули системы
+     "screens": [{{"text": "...", "source": "..."}}],       // UI-экраны, формы, дашборды
+     "reports": [{{"text": "...", "source": "..."}}],       // Отчёты и аналитика
+     "integrations": [{{"text": "...", "source": "..."}}],  // Интеграционные функции
+     "nfr": [{{"text": "...", "source": "..."}}]            // Нефункциональные: производительность, безопасность, доступность
+   }}
+
+8. "source_excerpts": Объект с общими цитатами:
+   - "client_name": цитата, откуда взято название
+   - "project_essence": цитата с описанием сути
+
+Каждая цитата ("source") должна быть точным фрагментом из текста.
+Верни ТОЛЬКО валидный JSON.
+
+Текст ТЗ:
+{truncated_text}
+    """
+
     try:
-        response = client.chat.completions.create(
+        response_1 = client.chat.completions.create(
             model=MODEL_NAME,
             messages=[
-                {"role": "system", "content": "Ты системный аналитик. Отвечай только валидным JSON."},
-                {"role": "user", "content": prompt}
+                {"role": "system", "content": "Ты системный аналитик. Твоя задача — точно извлечь данные из текста. Отвечай только JSON."},
+                {"role": "user", "content": prompt_extract}
             ],
-            temperature=0.2
+            temperature=0.1
         )
-        
-        raw_content = response.choices[0].message.content
-        # Очистка от Markdown
-        clean_content = raw_content.strip().replace("```json", "").replace("```", "")
-        result = json.loads(clean_content)
-        
-        # Гарантируем наличие полей
-        if "requirement_issues" not in result:
-            result["requirement_issues"] = []
-        if "source_excerpts" not in result:
-            result["source_excerpts"] = {}
-        if "suggested_stages" not in result:
-            result["suggested_stages"] = ["Сбор данных", "Прототип", "Разработка", "Тестирование"]
-        if "suggested_roles" not in result:
-            result["suggested_roles"] = ["Менеджер", "Frontend", "Backend", "Дизайнер"]
-            
-        return result
+        raw_json_1 = response_1.choices[0].message.content.strip().replace("```json", "").replace("```", "")
+        extracted_data = json.loads(raw_json_1)
     except Exception as e:
-        activity.logger.error(f"LLM Error: {e}")
-        # Возвращаем структуру с ошибкой, чтобы workflow не падал
-        return {
-            "client_name": "Ошибка анализа", 
-            "key_features": [],
-            "requirement_issues": [],
-            "source_excerpts": {},
-            "suggested_stages": ["Сбор данных", "Прототип", "Разработка", "Тестирование"],
-            "suggested_roles": ["Менеджер", "Frontend", "Backend", "Дизайнер"]
-        }
+        activity.logger.error(f"Extraction Phase Error: {e}")
+        return _get_error_stub(str(e))
+
+    # --- ЭТАП 2: АНАЛИЗ И ОЦЕНКА (ANALYSIS PHASE) ---
+    # Задача: На основе извлеченных данных сделать выводы и найти проблемы в ИСХОДНОМ ТЕКСТЕ.
+    
+    context_for_analysis = json.dumps(extracted_data, ensure_ascii=False, indent=2)
+
+    prompt_analyze = f"""
+Выполни аналитику проекта. Используй извлеченные данные и оригинальный текст ТЗ.
+
+Данные проекта (из JSON):
+{context_for_analysis}
+
+Оригинальный текст ТЗ (для поиска проблем и точных цитат):
+{truncated_text}
+
+Задачи:
+1. "requirement_issues": Найди проблемы в требованиях (нечеткие, противоречивые, нереализуемые).
+   Формат: [{{"type": "questionable", "field": "...", "category": "...", "item_text": "...", "source": "...", "reason": "..."}}]
+   Поле "field" = "key_features", поле "category" = категория (modules, screens, reports, integrations, nfr).
+   ВАЖНО: Поле "source" должно быть точной цитатой из Текста ТЗ.
+   ВАЖНО: Поле "reason" должно быть НА РУССКОМ ЯЗЫКЕ.
+   Если проблем нет — пустой массив [].
+
+2. "suggested_stages": Предложи этапы разработки (массив строк).
+   Выбирай ТОЛЬКО из: ["Аналитика и ТЗ", "Дизайн UI/UX", "Прототипирование", "Backend", "Frontend", "Mobile", "ML/AI", "Тестирование", "Деплой", "Поддержка"].
+
+3. "suggested_roles": Предложи команду (массив строк).
+   Выбирай ТОЛЬКО из: ["PM", "Аналитик", "Дизайнер", "Frontend-dev", "Backend-dev", "Mobile-dev", "ML-Engineer", "DevOps", "QA"].
+
+4. "key_features_estimates": Оцени каждый пункт из всех категорий "key_features" в часах (4-40 часов на фичу).
+   Формат: Объект, где ключ — текст требования, значение — часы (int).
+   Пройди по ВСЕМ категориям: modules, screens, reports, integrations, nfr.
+
+Верни JSON с полями: requirement_issues, suggested_stages, suggested_roles, key_features_estimates.
+    """
+
+    try:
+        response_2 = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": "Ты опытный IT-архитектор. Верни валидный JSON."},
+                {"role": "user", "content": prompt_analyze}
+            ],
+            temperature=0.3
+        )
+        raw_json_2 = response_2.choices[0].message.content.strip().replace("```json", "").replace("```", "")
+        analysis_data = json.loads(raw_json_2)
+        
+        # --- СЛИЯНИЕ ---
+        final_result = extracted_data.copy()
+        final_result.update(analysis_data)
+        
+        # Переносим часы из key_features_estimates в key_features (теперь с категориями)
+        estimates = analysis_data.get("key_features_estimates", {})
+        key_features_raw = final_result.get("key_features", {})
+        
+        # Обработка новой структуры с категориями
+        if isinstance(key_features_raw, dict):
+            updated_features = {}
+            for category, features_list in key_features_raw.items():
+                updated_category = []
+                if isinstance(features_list, list):
+                    for feature in features_list:
+                        if isinstance(feature, str):
+                            feat_text = feature
+                            feature_obj = {"text": feat_text, "source": ""}
+                        else:
+                            feat_text = feature.get("text", "")
+                            feature_obj = feature.copy()
+                        
+                        hours = estimates.get(feat_text, 0)
+                        # Fuzzy match fallback
+                        if hours == 0:
+                            for est_key, h in estimates.items():
+                                if est_key in feat_text or feat_text in est_key:
+                                    hours = h
+                                    break
+                        
+                        feature_obj["estimated_hours"] = hours if hours > 0 else 5
+                        feature_obj["category"] = category
+                        updated_category.append(feature_obj)
+                updated_features[category] = updated_category
+            final_result["key_features"] = updated_features
+        else:
+            # Fallback для старой структуры (массив)
+            updated_features = []
+            features_list = key_features_raw if isinstance(key_features_raw, list) else []
+            for feature in features_list:
+                if isinstance(feature, str):
+                    feat_text = feature
+                    feature_obj = {"text": feat_text, "source": ""}
+                else:
+                    feat_text = feature.get("text", "")
+                    feature_obj = feature.copy()
+                
+                hours = estimates.get(feat_text, 0)
+                if hours == 0:
+                    for est_key, h in estimates.items():
+                        if est_key in feat_text or feat_text in est_key:
+                            hours = h
+                            break
+                
+                feature_obj["estimated_hours"] = hours if hours > 0 else 5
+                updated_features.append(feature_obj)
+            final_result["key_features"] = updated_features
+        
+        # Заглушки
+        if "source_excerpts" not in final_result:
+             final_result["source_excerpts"] = {}
+
+        return final_result
+
+    except Exception as e:
+        activity.logger.error(f"Analysis Phase Error: {e}")
+        extracted_data["error_analysis"] = str(e)
+        extracted_data["suggested_stages"] = ["Аналитика", "Разработка"]
+        extracted_data["suggested_roles"] = ["PM", "Разработчик"]
+        return extracted_data
+
+def _get_error_stub(msg: str) -> dict:
+    return {
+        "client_name": "Ошибка анализа",
+        "project_essence": f"Не удалось обработать ТЗ: {msg}",
+        "key_features": [],
+        "requirement_issues": [],
+        "suggested_stages": ["Аналитика"],
+        "suggested_roles": ["PM"]
+    }
 
 @activity.defn
 async def estimate_hours_activity(tz_data: dict, stages: list, roles: list) -> dict:
@@ -343,7 +444,7 @@ async def analyze_requirements_activity(text: str) -> dict:
     """
     Анализ текста через vLLM. Извлечение JSON.
     """
-    MAX_CHARS = int(os.getenv("TZ_MAX_CHARS", "90000"))
+    MAX_CHARS = int(os.getenv("TZ_MAX_CHARS", "180000"))
     prompt = f"""
     Извлеки данные из ТЗ в формате JSON: client_name, deadline, key_features.
     Tекст: {text[:MAX_CHARS]} 
