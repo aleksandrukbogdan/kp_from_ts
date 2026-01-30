@@ -13,6 +13,11 @@ from workflows import ProposalWorkflow
 from users import validate_user
 from fastapi.responses import StreamingResponse
 from utils_docx import markdown_to_docx
+import shutil
+import uuid
+
+SHARED_DIR = "/shared_data"
+os.makedirs(SHARED_DIR, exist_ok=True)
 
 app = FastAPI(title="Agent KP API")
 
@@ -82,17 +87,25 @@ async def start_workflow(
     user: str = Depends(verify_auth)
 ):
     client = await get_temporal_client()
-    content = await file.read()
     
-    # Генерация чистого ID (MD5 hash) для красивых логов и кэширования одинаковых файлов
-    import hashlib
-    file_hash = hashlib.md5((file.filename + str(len(content))).encode()).hexdigest()
-    wf_id = f"cp-{file_hash}"
+    # Genererate ID and Path
+    unique_id = str(uuid.uuid4())
+    safe_filename = file.filename.replace(" ", "_").replace("/", "")
+    file_path = os.path.join(SHARED_DIR, f"{unique_id}_{safe_filename}")
+    
+    # Stream save to disk (Memory efficient)
+    try:
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+    except Exception as e:
+         raise HTTPException(status_code=500, detail=f"Failed to save file: {e}")
+    
+    wf_id = f"cp-{unique_id}"
     
     try:
         handle = await client.start_workflow(
             ProposalWorkflow.run,
-            args=[content, file.filename],
+            args=[file_path, file.filename], # Pass PATH, not content
             id=wf_id,
             task_queue="proposal-queue", # Важно: совпадает с worker.py
         )
@@ -105,15 +118,42 @@ async def start_workflow(
 
 @app.get("/api/status/{workflow_id}")
 async def get_status(workflow_id: str, user: str = Depends(verify_auth)):
+    from datetime import timedelta
+    
     client = await get_temporal_client()
     handle = client.get_workflow_handle(workflow_id)
     
     try:
-        # Используем твой Query метод из workflows.py
-        state = await handle.query(ProposalWorkflow.get_data)
+        # Query с коротким timeout - если worker занят, вернём статус "обработка"
+        state = await handle.query(ProposalWorkflow.get_data, rpc_timeout=timedelta(seconds=10))
         return state
     except Exception as e:
-        raise HTTPException(status_code=404, detail="Workflow not found")
+        error_msg = str(e).lower()
+        print(f"Query error for {workflow_id}: {type(e).__name__}: {e}")
+        
+        # Query timeout = worker занят LLM-активностью, workflow всё ещё работает
+        if "timed out" in error_msg or "timeout" in error_msg:
+            print(f"Query timeout for {workflow_id} - worker busy, returning PROCESSING status")
+            return {
+                "status": "PROCESSING",
+                "extracted_data": None,
+                "final_proposal": None,
+                "raw_text_preview": None,
+                "message": "Worker is processing LLM request, please wait..."
+            }
+        
+        # Проверяем, существует ли workflow вообще
+        try:
+            await handle.describe()
+            # Workflow существует, но query не удался - возвращаем статус обработки
+            return {
+                "status": "PROCESSING",
+                "extracted_data": None,
+                "final_proposal": None
+            }
+        except Exception:
+            print(f"Workflow not found: {workflow_id}")
+            raise HTTPException(status_code=404, detail="Workflow not found")
 
 @app.post("/api/approve/{workflow_id}")
 async def approve_workflow(

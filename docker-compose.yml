@@ -3,7 +3,7 @@ version: '3.8'
 services:
   # 1. Frontend (React + Vite Proxy)
   frontend:
-    image: node:22-alpine
+    image: node:20-alpine
     container_name: react_frontend
     working_dir: /app
     volumes:
@@ -33,6 +33,9 @@ services:
       - temporal-server
     networks:
       - ai_platform_network
+    volumes:
+      - ./shared_data:/shared_data
+      - ./:/app
 
   # 3. Worker (Python Temporal Worker)
   ai-worker-kp:
@@ -40,12 +43,23 @@ services:
     container_name: agent_kp_worker
     command: python worker.py
     env_file: .env
+    environment:
+      - RUST_LOG=temporalio_sdk_core=error # Скрыть WARN логи Temporal
     depends_on:
       - temporal-server
     networks:
       - ai_platform_network
-
-  # 4. Temporal Server
+    volumes:
+      - ./shared_data:/shared_data
+      - ./:/app
+    #deploy:
+    #  resources:
+    #    reservations:
+    #      devices:
+    #        - driver: nvidia
+    #          device_ids: [ '0' ] # GPU 0 (первая H100)
+    #          capabilities: [ gpu ]
+    # 4. Temporal Server
   temporal-server:
     image: temporalio/admin-tools:latest
     container_name: temporal_server

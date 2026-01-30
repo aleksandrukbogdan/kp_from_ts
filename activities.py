@@ -1,466 +1,486 @@
+
 import io
 import json
 import os
 import base64
-
+import re
+import threading
+import asyncio
+from pathlib import Path
 from temporalio import activity
-from openai import OpenAI
+from typing import List, Dict, Optional, Any
 
 from dotenv import load_dotenv
 
-
-
+# New Modules
+from llm_service import LLMService
+from schemas import (
+    ExtractedTZData, 
+    AnalysisTZResult, 
+    BudgetResult, 
+    ProposalResult, 
+    KeyFeaturesDetails,
+    SourceText
+)
+from utils_text import split_markdown, merge_extracted_data
 
 load_dotenv()
 
-# client = OpenAI(...)  <-- Removed global init
-
-
 MODEL_NAME = os.getenv("QWEN_MODEL_NAME")
 
-# Глобальная переменная для кэширования конвертера
+# --- Global Shared Resources ---
 _doc_converter = None
+_doc_converter_lock = threading.Lock()
 
 def get_docling_converter():
+    """Thread-safe singleton for Docling converter."""
     global _doc_converter
-    if _doc_converter is not None:
+    with _doc_converter_lock:
+        if _doc_converter is not None:
+            return _doc_converter
+
+        # --- Docling Integration ---
+        from docling.datamodel.base_models import InputFormat
+        from docling.document_converter import DocumentConverter, PdfFormatOption
+        from docling.datamodel.pipeline_options import PdfPipelineOptions, AcceleratorOptions, AcceleratorDevice
+
+        is_dev = os.getenv("IS_DEV", "false").lower() == "true"
+        
+        try:
+            # Pipeline Setup
+            pipeline_options = PdfPipelineOptions()
+            pipeline_options.do_ocr = True
+            pipeline_options.do_table_structure = True
+            pipeline_options.table_structure_options.do_cell_matching = True
+            
+            # Accelerator Setup
+            device = AcceleratorDevice.CPU if is_dev else AcceleratorDevice.CUDA
+            print(f"Docling initialising... IS_DEV={is_dev}, Device={device}")
+            
+            pipeline_options.accelerator_options = AcceleratorOptions(
+                num_threads=4, device=device
+            )
+
+            _doc_converter = DocumentConverter(
+                format_options={
+                    InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
+                }
+            )
+        except Exception as e:
+            print(f"Docling Init Error: {e}. using fallback.")
+            _doc_converter = DocumentConverter() # Fallback
+        
         return _doc_converter
 
-    # --- Docling Integration ---
-    from docling.datamodel.base_models import InputFormat
-    from docling.document_converter import DocumentConverter, PdfFormatOption
-    from docling.datamodel.pipeline_options import PdfPipelineOptions, AcceleratorOptions, AcceleratorDevice
-
-    is_dev = os.getenv("IS_DEV", "false").lower() == "true"
-    
-    try:
-        # Настройка пайплайна для PDF
-        pipeline_options = PdfPipelineOptions()
-        pipeline_options.do_ocr = True
-        pipeline_options.do_table_structure = True
-        pipeline_options.table_structure_options.do_cell_matching = True
-        
-        # Настройка ускорителя
-        # Если IS_DEV=true (локально), используем CPU. Иначе - CUDA.
-        device = AcceleratorDevice.CPU if is_dev else AcceleratorDevice.CUDA
-        print(f"Docling initialising... IS_DEV={is_dev}, Device={device}")
-        
-        pipeline_options.accelerator_options = AcceleratorOptions(
-            num_threads=4, device=device
-        )
-
-        _doc_converter = DocumentConverter(
-            format_options={
-                InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
-            }
-        )
-    except Exception as e:
-        print(f"Ошибка инициализации Docling: {e}. Используем fallback.")
-        _doc_converter = DocumentConverter() # Fallback config
-    
-    return _doc_converter
-
 @activity.defn
-async def parse_file_activity(file_content:bytes, file_name:str) -> str:
-    """Парсинг документа через Docling. Возвращает Markdown."""
-    file_type = file_name.split('.')[-1].lower()
-    
-    # Получаем инициализированный конвертер
+async def parse_file_activity(file_path:str, file_name:str) -> str:
+    """Parses document via Docling and saves Markdown to a file. Returns path to MD file."""
     doc_converter = get_docling_converter()
-
-    # Сохраняем во временный файл, так как Docling работает с путями или потоками
-    # Для простоты используем BytesIO, если Docling поддерживает, или tempfile
-    
-    import tempfile
-    from pathlib import Path
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=f".{file_type}") as tmp_file:
-        tmp_file.write(file_content)
-        tmp_path = Path(tmp_file.name)
+    input_path = Path(file_path)
 
     try:
-        # Конвертация
-        print(f"Docling: Начинаю парсинг файла {file_name} (размер: {len(file_content)} байт)...")
-        # is_dev доступен через os.getenv, но для логов можно повторить или пропустить, 
-        # так как это уже выводится при инициализации
-            
-        result = doc_converter.convert(tmp_path)
-        print("Docling: Конвертация завершена успешно.")
+        activity.logger.info(f"Docling: Starting parsing for {file_path}...")
         
-        # Получение Markdown
+        # Offload CPU-bound task to a separate thread to prevent blocking Temporal heartbeat
+        # We need to wrap the sync call
+        def _run_docling():
+            return doc_converter.convert(input_path)
+
+        result = await asyncio.to_thread(_run_docling)
+        activity.logger.info("Docling: Conversion successful.")
+        
         markdown_text = result.document.export_to_markdown()
         
-        # Удаляем временный файл
-        if os.path.exists(tmp_path):
-            os.unlink(tmp_path)
-        
-        return markdown_text
-
     except Exception as e:
-        print(f"Ошибка Docling: {e}")
-        if os.path.exists(tmp_path):
-             os.unlink(tmp_path)
-        return f"Ошибка при обработке файла: {e}"
+        activity.logger.error(f"Docling Error: {e}")
+        
+        # Lightweight Fallback for DOCX
+        markdown_text = ""
+        try:
+            if str(input_path).endswith(".docx"):
+                activity.logger.info("Attempting lightweight DOCX fallback...")
+                import docx
+                doc = docx.Document(file_path)
+                markdown_text = "\n\n".join([p.text for p in doc.paragraphs if p.text.strip()])
+        except Exception as fallback_e:
+            activity.logger.error(f"Fallback Error: {fallback_e}")
+
+        if not markdown_text:
+            return ""
+
+    # Save Markdown to a separate file (Blob Pattern) to avoid bloating Temporal History
+    md_filename = f"{input_path.stem}_parsed.md"
+    md_path = input_path.parent / md_filename
+    
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write(markdown_text)
+        
+    return str(md_path)
 
 @activity.defn
-async def ocr_document_activity(file_bytes: bytes) -> str:
-    """
-    если обычное чтение не справилось, включается ocr
-    """
-    base64_image = base64.b64encode(file_bytes).decode('utf-8')
-    
-    messages = [{
-        "role": "user",
-        "content": [
-            {"type": "text", "text": "Прочитай весь текст с этого изображения."},
-            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}},
-        ],
-    }]
+async def ocr_document_activity(file_path: str) -> str:
+    """Fallback OCR if standard parsing fails."""
+    try:
+        with open(file_path, "rb") as f:
+            file_bytes = f.read()
 
-    client = OpenAI(
-        base_url=os.getenv("QWEN_BASE_URL"),
-        api_key=os.getenv("QWEN_API_KEY"),
-    )
-    response = client.chat.completions.create(
-        model=MODEL_NAME, messages=messages, max_tokens=2048
-    )
-    return response.choices[0].message.content
+        base64_image = base64.b64encode(file_bytes).decode('utf-8')
+        
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Transcribe ALL text from this image exactly as it appears. Detect layout if possible."},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}},
+            ],
+        }]
+
+        llm = LLMService()
+        text = await llm.create_chat_completion(messages=messages)
+        
+        # Save OCR result to file as well
+        input_path = Path(file_path)
+        md_path = input_path.parent / f"{input_path.stem}_ocr.md"
+        with open(md_path, "w", encoding="utf-8") as f:
+            f.write(text)
+            
+        return str(md_path)
+        
+    except Exception as e:
+        activity.logger.error(f"OCR Activity Error: {e}")
+        return "" # Signal failure
 
 @activity.defn
 async def save_budget_stub(data: dict) -> str:
-    #Заглушка пока нет базы данных и алгоритма расчета
-    print(f'якобы сохранение в постгрес {data}')
+    """Stub for database saving."""
+    print(f'Stub saving to Postgres: {data}')
     return "ok"
-
-
-@activity.defn
-async def analyze_tz_activity(text: str) -> dict:
-    """Анализ ТЗ: Двухэтапный подход для стабильности (Extraction -> Analysis)"""
-    MAX_CHARS = int(os.getenv("TZ_MAX_CHARS", "180000"))
-    truncated_text = text[:MAX_CHARS]
-    
-    client = OpenAI(
-        base_url=os.getenv("QWEN_BASE_URL"),
-        api_key=os.getenv("QWEN_API_KEY"),
-    )
-
-    # --- ЭТАП 1: ИЗВЛЕЧЕНИЕ ФАКТОВ (EXTRACTION PHASE) ---
-    # Задача: Просто найти и процитировать, ничего не придумывать.
-    # Мы просим модель вернуть JSON с цитатами.
-    prompt_extract = f"""
-ВАЖНО: Все ответы ДОЛЖНЫ быть на РУССКОМ языке. Не используй английский.
-
-Проанализируй текст технического задания и извлеки фактические данные в формат JSON.
-Ты можешь систематизировать информацию, но НЕ придумывай ничего, используй только то, что есть в тексте.
-
-1. "client_name": Название компании клиента.
-
-2. "project_essence": Суть проекта в 1-2 предложениях.
-
-3. "project_type": Тип проекта (Web, Mobile, ML, Design, Other).
-
-4. "business_goals": Массив целей ( [{{"text": "...", "source": "..."}}] ).
-
-5. "tech_stack": Технологии, НА КОТОРЫХ будет написан продукт.
-   Формат: [{{"text": "...", "source": "..."}}]
-   ВКЛЮЧАЙ: Python, React, Vue, PostgreSQL, Docker, FastAPI, Node.js, Redis, Kubernetes
-   НЕ ВКЛЮЧАЙ: 1C, SAP, Bitrix24, CRM клиента, внешние API, сторонние сервисы
-   ВАЖНО: Исключи словари, глоссарии и определения терминов.
-
-6. "client_integrations": Внешние системы, С КОТОРЫМИ продукт будет интегрироваться.
-   Формат: [{{"text": "...", "source": "..."}}]
-   ВКЛЮЧАЙ: 1C, SAP, Bitrix24, API банка, Telegram-бот, СДЭК, почтовые сервисы, платежные системы
-   НЕ ВКЛЮЧАЙ: React, PostgreSQL, Docker (это стек разработки, а не интеграции)
-
-7. "key_features": Объект с категориями функциональных требований.
-   ВАЖНО: Извлеки ВСЕ требования из текста. Лучше включить лишнее, чем пропустить важное.
-   ВАЖНО: Перечитай текст дважды — проверь таблицы, списки, приложения.
-   Целевое количество: 15-50 пунктов суммарно по всем категориям.
-   
-   Формат:
-   {{
-     "modules": [{{"text": "...", "source": "..."}}],       // Логические модули системы
-     "screens": [{{"text": "...", "source": "..."}}],       // UI-экраны, формы, дашборды
-     "reports": [{{"text": "...", "source": "..."}}],       // Отчёты и аналитика
-     "integrations": [{{"text": "...", "source": "..."}}],  // Интеграционные функции
-     "nfr": [{{"text": "...", "source": "..."}}]            // Нефункциональные: производительность, безопасность, доступность
-   }}
-
-8. "source_excerpts": Объект с общими цитатами:
-   - "client_name": цитата, откуда взято название
-   - "project_essence": цитата с описанием сути
-
-Каждая цитата ("source") должна быть точным фрагментом из текста.
-Верни ТОЛЬКО валидный JSON.
-
-Текст ТЗ:
-{truncated_text}
-    """
-
-    try:
-        response_1 = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[
-                {"role": "system", "content": "Ты системный аналитик. Твоя задача — точно извлечь данные из текста. Отвечай только JSON."},
-                {"role": "user", "content": prompt_extract}
-            ],
-            temperature=0.1
-        )
-        raw_json_1 = response_1.choices[0].message.content.strip().replace("```json", "").replace("```", "")
-        extracted_data = json.loads(raw_json_1)
-    except Exception as e:
-        activity.logger.error(f"Extraction Phase Error: {e}")
-        return _get_error_stub(str(e))
-
-    # --- ЭТАП 2: АНАЛИЗ И ОЦЕНКА (ANALYSIS PHASE) ---
-    # Задача: На основе извлеченных данных сделать выводы и найти проблемы в ИСХОДНОМ ТЕКСТЕ.
-    
-    context_for_analysis = json.dumps(extracted_data, ensure_ascii=False, indent=2)
-
-    prompt_analyze = f"""
-Выполни аналитику проекта. Используй извлеченные данные и оригинальный текст ТЗ.
-
-Данные проекта (из JSON):
-{context_for_analysis}
-
-Оригинальный текст ТЗ (для поиска проблем и точных цитат):
-{truncated_text}
-
-Задачи:
-1. "requirement_issues": Найди проблемы в требованиях (нечеткие, противоречивые, нереализуемые).
-   Формат: [{{"type": "questionable", "field": "...", "category": "...", "item_text": "...", "source": "...", "reason": "..."}}]
-   Поле "field" = "key_features", поле "category" = категория (modules, screens, reports, integrations, nfr).
-   ВАЖНО: Поле "source" должно быть точной цитатой из Текста ТЗ.
-   ВАЖНО: Поле "reason" должно быть НА РУССКОМ ЯЗЫКЕ.
-   Если проблем нет — пустой массив [].
-
-2. "suggested_stages": Предложи этапы разработки (массив строк).
-   Выбирай ТОЛЬКО из: ["Аналитика и ТЗ", "Дизайн UI/UX", "Прототипирование", "Backend", "Frontend", "Mobile", "ML/AI", "Тестирование", "Деплой", "Поддержка"].
-
-3. "suggested_roles": Предложи команду (массив строк).
-   Выбирай ТОЛЬКО из: ["PM", "Аналитик", "Дизайнер", "Frontend-dev", "Backend-dev", "Mobile-dev", "ML-Engineer", "DevOps", "QA"].
-
-4. "key_features_estimates": Оцени каждый пункт из всех категорий "key_features" в часах (4-40 часов на фичу).
-   Формат: Объект, где ключ — текст требования, значение — часы (int).
-   Пройди по ВСЕМ категориям: modules, screens, reports, integrations, nfr.
-
-Верни JSON с полями: requirement_issues, suggested_stages, suggested_roles, key_features_estimates.
-    """
-
-    try:
-        response_2 = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[
-                {"role": "system", "content": "Ты опытный IT-архитектор. Верни валидный JSON."},
-                {"role": "user", "content": prompt_analyze}
-            ],
-            temperature=0.3
-        )
-        raw_json_2 = response_2.choices[0].message.content.strip().replace("```json", "").replace("```", "")
-        analysis_data = json.loads(raw_json_2)
-        
-        # --- СЛИЯНИЕ ---
-        final_result = extracted_data.copy()
-        final_result.update(analysis_data)
-        
-        # Переносим часы из key_features_estimates в key_features (теперь с категориями)
-        estimates = analysis_data.get("key_features_estimates", {})
-        key_features_raw = final_result.get("key_features", {})
-        
-        # Обработка новой структуры с категориями
-        if isinstance(key_features_raw, dict):
-            updated_features = {}
-            for category, features_list in key_features_raw.items():
-                updated_category = []
-                if isinstance(features_list, list):
-                    for feature in features_list:
-                        if isinstance(feature, str):
-                            feat_text = feature
-                            feature_obj = {"text": feat_text, "source": ""}
-                        else:
-                            feat_text = feature.get("text", "")
-                            feature_obj = feature.copy()
-                        
-                        hours = estimates.get(feat_text, 0)
-                        # Fuzzy match fallback
-                        if hours == 0:
-                            for est_key, h in estimates.items():
-                                if est_key in feat_text or feat_text in est_key:
-                                    hours = h
-                                    break
-                        
-                        feature_obj["estimated_hours"] = hours if hours > 0 else 5
-                        feature_obj["category"] = category
-                        updated_category.append(feature_obj)
-                updated_features[category] = updated_category
-            final_result["key_features"] = updated_features
-        else:
-            # Fallback для старой структуры (массив)
-            updated_features = []
-            features_list = key_features_raw if isinstance(key_features_raw, list) else []
-            for feature in features_list:
-                if isinstance(feature, str):
-                    feat_text = feature
-                    feature_obj = {"text": feat_text, "source": ""}
-                else:
-                    feat_text = feature.get("text", "")
-                    feature_obj = feature.copy()
-                
-                hours = estimates.get(feat_text, 0)
-                if hours == 0:
-                    for est_key, h in estimates.items():
-                        if est_key in feat_text or feat_text in est_key:
-                            hours = h
-                            break
-                
-                feature_obj["estimated_hours"] = hours if hours > 0 else 5
-                updated_features.append(feature_obj)
-            final_result["key_features"] = updated_features
-        
-        # Заглушки
-        if "source_excerpts" not in final_result:
-             final_result["source_excerpts"] = {}
-
-        return final_result
-
-    except Exception as e:
-        activity.logger.error(f"Analysis Phase Error: {e}")
-        extracted_data["error_analysis"] = str(e)
-        extracted_data["suggested_stages"] = ["Аналитика", "Разработка"]
-        extracted_data["suggested_roles"] = ["PM", "Разработчик"]
-        return extracted_data
-
-def _get_error_stub(msg: str) -> dict:
-    return {
-        "client_name": "Ошибка анализа",
-        "project_essence": f"Не удалось обработать ТЗ: {msg}",
-        "key_features": [],
-        "requirement_issues": [],
-        "suggested_stages": ["Аналитика"],
-        "suggested_roles": ["PM"]
-    }
 
 @activity.defn
 async def estimate_hours_activity(tz_data: dict, stages: list, roles: list) -> dict:
     """
-    Оценка трудозатрат на основе ТЗ, этапов и ролей.
-    Возвращает матрицу: {"Этап": {"Роль": часы}}
+    Generates Budget Matrix: Stage -> Role -> Hours
     """
-    prompt = f"""
-На основе данных из технического задания, оцени трудозатраты в часах.
-
-Данные проекта:
-- Суть проекта: {tz_data.get('project_essence', 'Не указано')}
-- Тип проекта: {tz_data.get('project_type', 'Не указан')}
-- Ключевой функционал: {tz_data.get('key_features', [])}
-- Стек: {tz_data.get('tech_stack', 'Не указан')}
-- Интеграции: {tz_data.get('client_integrations', [])}
-
-Этапы работ: {stages}
-Роли в команде: {roles}
-
-Верни JSON-объект, где ключи — названия этапов, значения — объекты с ролями и часами.
-Пример:
-{{
-  "Сбор данных": {{"Менеджер": 8, "ML-Инженер": 4, "Frontend": 0, "Backend": 2, "Дизайнер": 0}},
-  "Прототип": {{"Менеджер": 4, "ML-Инженер": 0, "Frontend": 8, "Backend": 0, "Дизайнер": 16}}
-}}
-
-Оценивай реалистично для типичного проекта. Если роль не нужна на этапе — ставь 0.
-Верни ТОЛЬКО валидный JSON.
-    """
+    llm = LLMService()
     
-    client = OpenAI(
-        base_url=os.getenv("QWEN_BASE_URL"),
-        api_key=os.getenv("QWEN_API_KEY"),
-    )
     try:
-        response = client.chat.completions.create(
-            model=MODEL_NAME,
+        activity.logger.info("Starting Budget Estimation")
+        budget_result: BudgetResult = await llm.create_structured_completion(
             messages=[
-                {"role": "system", "content": "Ты опытный project-менеджер. Отвечай только валидным JSON."},
-                {"role": "user", "content": prompt}
+                {"role": "system", "content": "Ты Project Manager. Оцени трудозатраты в часах для каждого этапа и роли. "
+                                              "Используй ТОЛЬКО предложенные этапы и роли. Отвечай на РУССКОМ (названия могут быть англ, но суть русская)."},
+                {"role": "user", "content": f"""
+Проект: {tz_data.get('project_essence', 'N/A')}
+Стек: {tz_data.get('tech_stack', [])}
+
+Этапы (stages): {stages}
+Роли (roles): {roles}
+
+Заполни матрицу часов:
+Для КАЖДОГО этапа из списка Stages укажи часы для КАЖДОЙ роли из списка Roles.
+Если роль не участвует в этапе, ставь 0.
+                """}
             ],
-            temperature=0.3
+            output_model=BudgetResult,
+            tool_name="submit_budget"
         )
         
-        raw_content = response.choices[0].message.content
-        clean_content = raw_content.strip().replace("```json", "").replace("```", "")
-        return json.loads(clean_content)
+        # Transform to Matrix format: {Stage: {Role: Hours}}
+        matrix = {}
+        
+        # Index results
+        for stage_est in budget_result.stages:
+            s_name = stage_est.stage_name
+            matrix[s_name] = {}
+            for role_est in stage_est.role_estimates:
+                matrix[s_name][role_est.role_name] = role_est.hours
+
+        # Ensure full matrix based on requested stages/roles (fill missing with 0)
+        final_matrix = {}
+        for stage in stages:
+            final_matrix[stage] = {}
+            for role in roles:
+                val = 0
+                # Try exact match or loose matching if needed
+                if stage in matrix and role in matrix[stage]:
+                    val = matrix[stage][role]
+                final_matrix[stage][role] = val
+                
+        return final_matrix
+
     except Exception as e:
-        activity.logger.error(f"Estimate Hours Error: {e}")
-        # Возвращаем пустую матрицу при ошибке
+        activity.logger.error(f"Budget Estimation Error: {e}")
+        # Return empty matrix
         return {stage: {role: 0 for role in roles} for stage in stages}
 
 @activity.defn
 async def generate_proposal_activity(data: dict, budget_matrix: dict, rates: dict) -> str:
-    """Генерация текста КП"""
-
-    # Формируем текстовое описание сметы для ИИ из матрицы
-    detailed_budget_text = "Детальный расчет трудозатрат по этапам:\n"
-    total_project_sum = 0
+    """Generates Commercial Proposal Markdown"""
+    llm = LLMService()
+    
+    # Pre-calculate budget text
+    detailed_budget_text = "### Estimated Budget\n\n| Stage | Role | Hours | Rate | Cost |\n|---|---|---|---|---|\n"
+    total_sum = 0
     
     for stage, roles_hours in budget_matrix.items():
-        detailed_budget_text += f"Этап '{stage}':\n"
         for role, hours in roles_hours.items():
             if hours > 0:
                 rate = rates.get(role, 0)
                 cost = hours * rate
-                total_project_sum += cost
-                detailed_budget_text += f"  - {role}: {hours} ч. по {rate} р./час = {cost} р.\n"
-
-    prompt = f"""
-    Напиши профессиональное коммерческое предложение.
-
-    ДАННЫЕ ДЛЯ ВКЛЮЧЕНИЯ В ДОКУМЕНТ:
-    1. Суть проекта: {data.get('project_essence')}
-    2. Бизнес-задачи: {data.get('business_goals')}
-    3. Ключевой функционал: {data.get('key_features')}
-    4. Этапы и Стек: {data.get('tech_stack')}
-    5. Требуемые интеграции: {data.get('client_integrations')}
+                total_sum += cost
+                detailed_budget_text += f"| {stage} | {role} | {hours} | {rate} | {cost} |\n"
     
-    ФИНАНСОВЫЙ РАЗДЕЛ (Оформи красиво в Markdown таблице):
-    {detailed_budget_text}
-    ИТОГО СТОИМОСТЬ: {total_project_sum} руб.
+    detailed_budget_text += f"\n**Total Estimated Cost: {total_sum} RUB**"
 
-    Стиль: Убедительный, деловой.
-    """
+    try:
+        proposal: ProposalResult = await llm.create_structured_completion(
+            messages=[
+                {"role": "system", "content": "Ты Менеджер по продажам. Напиши убедительное Коммерческое Предложение в формате Markdown на РУССКОМ языке."},
+                {"role": "user", "content": f"""
+Суть проекта: {data.get('project_essence')}
+Цели: {data.get('business_goals')}
+Функционал: {data.get('key_features')}
+Стек: {data.get('tech_stack')}
+
+Бюджет (включи эту таблицу в КП):
+{detailed_budget_text}
+
+Напиши полное КП со структурой: Введение, Понимание задачи, Решение (Стек, Функции), План работ, Бюджет (вставь таблицу), Призыв к действию.
+                """}
+            ],
+            output_model=ProposalResult,
+            tool_name="submit_proposal"
+        )
+        return proposal.markdown_content
+
+    except Exception as e:
+        activity.logger.error(f"Proposal Generation Error: {e}")
+        return "Error generating proposal."
+
+# --- New Map-Reduce Activities ---
+
+def _split_text_sync(md_file_path: str) -> List[Dict[str, Any]]:
+    """Sync implementation of splitting to be run in thread. Uses BYTES to avoid seek issues."""
+    CHUNK_SIZE = 12000 # Bytes approximately
+    OVERLAP = 1000     # Bytes
     
-    client = OpenAI(
-        base_url=os.getenv("QWEN_BASE_URL"),
-        api_key=os.getenv("QWEN_API_KEY"),
-    )
-    response = client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    return response.choices[0].message.content
+    chunks_defs = []
+    
+    try:
+        if not os.path.exists(md_file_path):
+             print(f"File not found for splitting: {md_file_path}")
+             return []
 
+        # OPEN AS BYTES
+        with open(md_file_path, "rb") as f:
+            content = f.read()
+            
+        text_len = len(content)
+        start = 0
+        
+        if text_len == 0:
+             return []
 
-
+        while start < text_len:
+            end = min(start + CHUNK_SIZE, text_len)
+            
+            # Smart split: Try to find a newline byte b'\n' to break cleanly
+            if end < text_len:
+                # Look for newline in the last 500 bytes of the chunk
+                # Ensure we don't start search before start
+                search_start = max(start, end - 500)
+                search_window = content[search_start : end]
+                
+                last_newline = search_window.rfind(b'\n')
+                if last_newline != -1:
+                    # Adjust end to the newline. 
+                    # last_newline is relative to search_window start.
+                    end = search_start + last_newline + 1 # +1 to include \n
+            
+            chunks_defs.append({
+                "file_path": md_file_path,
+                "start": start,
+                "end": end
+            })
+            
+            # Move start for next chunk, accounting for overlap
+            if end >= text_len:
+                break
+                
+            # Overlap logic: Move back N bytes
+            start = max(0, end - OVERLAP)
+            
+            # Align new start to a character boundary (avoid continuation bytes 0x80-0xBF)
+            # UTF-8: Multi-byte chars start with 11xxxxxx (0xC0+). Continuation bytes are 10xxxxxx (0x80-0xBF).
+            # ASCII is 0xxxxxxx (<0x80).
+            # So if byte is >= 0x80 and < 0xC0, it's a continuation byte.
+            while start < text_len and (content[start] & 0xC0 == 0x80):
+                start += 1
+            
+        return chunks_defs
+        
+    except Exception as e:
+        print(f"Split Text Failed: {e}")
+        return []
 
 @activity.defn
-async def analyze_requirements_activity(text: str) -> dict:
+async def split_text_activity(md_file_path: str) -> List[Dict[str, Any]]:
     """
-    Анализ текста через vLLM. Извлечение JSON.
+    Reads the markdown file and defines chunks.
+    Returns a list of Chunk Definitions: {'file_path': str, 'start': int, 'end': int}
     """
-    MAX_CHARS = int(os.getenv("TZ_MAX_CHARS", "180000"))
-    prompt = f"""
-    Извлеки данные из ТЗ в формате JSON: client_name, deadline, key_features.
-    Tекст: {text[:MAX_CHARS]} 
+    # Offload to thread to avoid Heartbeat timeout on large files
+    return await asyncio.to_thread(_split_text_sync, md_file_path)
+
+@activity.defn
+async def extract_chunk_activity(chunk_def: Dict[str, Any]) -> dict:
+    """Phase 1: Extraction for a single chunk (reading from file)."""
+    llm = LLMService()
+    try:
+        file_path = chunk_def["file_path"]
+        start = chunk_def["start"]
+        end = chunk_def["end"]
+        
+        chunk_text = ""
+        # OPEN AS BYTES
+        with open(file_path, "rb") as f:
+            f.seek(start)
+            chunk_bytes = f.read(end - start)
+            # Decode safely, ignoring errors at boundaries if overlap caused cuts
+            chunk_text = chunk_bytes.decode('utf-8', errors='ignore')
+            
+        activity.logger.info(f"Extracting data from chunk ({len(chunk_text)} chars)...")
+        
+        system_prompt = """Ты вдумчивый Системный Аналитик. Твоя задача — внимательно прочитать часть ТЗ и извлечь данные.
+        
+Шаг 1: РАССУЖДЕНИЕ (Reasoning)
+Сначала заполни поле 'reasoning'. В нем опиши своими словами:
+- О чем этот текст?
+- Какие ключевые функции или модули здесь описаны?
+- Видишь ли ты конкретные технологии или цели?
+Только после того, как ты проговоришь это, заполняй остальные поля.
+
+Шаг 2: ИЗВЛЕЧЕНИЕ (Extraction)
+Заполни остальные поля JSON.
+- client_name: Ищи название компании-заказчика. Если не найдено, верни пустую строку "".
+- project_type: Выбери один вариант, который ЛУЧШЕ ВСЕГО подходит: [Web, Mobile, ERP, CRM, AI, Integration, Other].
+    - Если система обрабатывает документы - скорее всего ERP или AI (если есть LLM).
+    - Если это мобильное приложение - Mobile.
+    - Если сайт - Web.
+- key_features: Разбей найденное на категории.
+
+ВАЖНОЕ ПРАВИЛО ФОРМАТИРОВАНИЯ:
+- В полях 'text' пиши ЧИСТЫЙ ТЕКСТ.
+- ЗАПРЕЩЕНО писать "Unknown", "N/A", "Нет". Просто пустая строка.
+"""
+        
+        extracted_data: ExtractedTZData = await llm.create_structured_completion(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Часть ТЗ:\n\n{chunk_text}"}
+            ],
+            output_model=ExtractedTZData,
+            tool_name="extract_tz_chunk"
+        )
+        return extracted_data.model_dump()
+    except Exception as e:
+        activity.logger.error(f"Chunk Extraction Failed: {e}")
+        # Return empty structure - soft failure, workflow continues
+        return ExtractedTZData().model_dump()
+
+@activity.defn
+async def merge_data_activity(data_list: List[dict]) -> dict:
+    """Aggregates list of partial results."""
+    # Convert dicts back to models
+    try:
+        models = [ExtractedTZData(**d) for d in data_list]
+        merged = merge_extracted_data(models)
+        return merged.model_dump()
+    except Exception as e:
+        activity.logger.error(f"Merge Failed: {e}")
+        return ExtractedTZData(project_essence=SourceText(text=f"Merge Error: {e}")).model_dump()
+
+@activity.defn
+async def analyze_project_activity(merged_data: dict) -> dict:
     """
+    Phase 2: Analysis based on aggregated data.
+    Populates requirement_issues, suggested_stages, suggested_roles, and estimates.
+    """
+    llm = LLMService()
     
-    client = OpenAI(
-        base_url=os.getenv("QWEN_BASE_URL"),
-        api_key=os.getenv("QWEN_API_KEY"),
-    )
-    response = client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.2
-    )
+    # We rely on the structured extracted data.
+    # START OPTIMIZATION: Filter context to avoid 50k+ char payloads
+    condensed_data = {
+        "project_essence": merged_data.get("project_essence", ""),
+        "project_type": merged_data.get("project_type", ""),
+        "business_goals": merged_data.get("business_goals", ""),
+        "tech_stack": merged_data.get("tech_stack", []),
+        "key_features": merged_data.get("key_features", {}), 
+        # Exclude 'client_integrations' if it's just raw text, or keep if crucial. 
+        # 'screens', 'reports' inside key_features might be enough.
+    }
     
-    # Тут твоя логика очистки JSON (strip, replace...)
-    raw_json = response.choices[0].message.content
-    # ... parsing logic ...
-    return json.loads(raw_json) # Заглушка, в реальности нужен try/except
+    context_json = json.dumps(condensed_data, indent=2, ensure_ascii=False)
+    # END OPTIMIZATION
+    
+    try:
+        activity.logger.info("Starting Project Analysis (Phase 2)")
+        analysis_result: AnalysisTZResult = await llm.create_structured_completion(
+            messages=[
+                {"role": "system", "content": "Ты IT Архитектор. Проанализируй данные проекта. Отвечай на РУССКОМ."},
+                {"role": "user", "content": f"""
+Данные проекта (извлеченные из ТЗ):
+{context_json}
+
+Задачи:
+1. Найди проблемные требования (неясные, противоречивые) в extracted data.
+2. Предложи этапы разработки и роли.
+3. Оцени часы (от 4 до 100) на КАЖДУЮ функцию из key_features.
+
+ВАЖНО ДЛЯ requirement_issues:
+- Поле "item_text" должно содержать ТОЛЬКО текст требования (например: "Система должна работать офлайн"). 
+- НЕ пиши туда JSON или Python-объекты вроде "text='...' source='...'".
+- Если проблема общая, напиши суть своими словами.
+                """}
+            ],
+            output_model=AnalysisTZResult,
+            tool_name="submit_analysis_v2"
+        )
+    except Exception as e:
+        activity.logger.error(f"Analysis Phase Failed: {e}")
+        # Return merged data as is
+        return merged_data
+
+    # Map results back to the main dict
+    final_dict = merged_data.copy()
+    analysis_dict = analysis_result.model_dump()
+
+    final_dict["requirement_issues"] = analysis_dict["requirement_issues"]
+    final_dict["suggested_stages"] = analysis_dict["suggested_stages"]
+    final_dict["suggested_roles"] = analysis_dict["suggested_roles"]
+
+    # Map estimates
+    estimates_map = {est['feature_text']: est['hours'] for est in analysis_dict.get('estimates', [])}
+    key_features = final_dict.get("key_features", {})
+    
+    if isinstance(key_features, dict):
+        for category, features in key_features.items():
+            if not isinstance(features, list): continue
+            for feature in features:
+                f_text = feature.get("text", "")
+                hours = 5
+                
+                # Check match
+                # Try exact
+                if f_text in estimates_map:
+                    hours = estimates_map[f_text]
+                else:
+                    # Try fuzzy
+                    for est_text, h in estimates_map.items():
+                        if est_text in f_text or f_text in est_text:
+                            hours = h
+                            break
+                
+                feature["estimated_hours"] = hours
+                feature["category"] = category
+
+    return final_dict

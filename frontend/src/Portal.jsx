@@ -5,7 +5,7 @@ import {
     Box, Chip, AppBar, Toolbar, Button, Avatar, Menu, MenuItem,
     IconButton, Divider
 } from '@mui/material';
-import { Description, Chat, Mic, VisibilityOff, Logout, Person } from '@mui/icons-material';
+import { Description, Chat, Mic, VisibilityOff, CompareArrows, Logout, Person } from '@mui/icons-material';
 import { useNavigate } from 'react-router-dom';
 import { config } from './config';
 
@@ -76,11 +76,20 @@ export default function Portal() {
             external: true
         },
         {
-            title: "Анонимайзер",
+            title: "Обезличиватель",
             desc: "Скрытие чувствительных данных",
             icon: <VisibilityOff fontSize="large" sx={{ color: 'white' }} />,
             gradient: 'linear-gradient(135deg, #757575 0%, #9E9E9E 100%)',
             path: config.ANONYMIZER_URL,
+            active: true,
+            external: true
+        },
+        {
+            title: "СравнениеДок",
+            desc: "Сравнение документов",
+            icon: <CompareArrows fontSize="large" sx={{ color: 'white' }} />,
+            gradient: 'linear-gradient(135deg, #7B1FA2 0%, #AB47BC 100%)',
+            path: config.DOC_COMPARE_URL,
             active: true,
             external: true
         }

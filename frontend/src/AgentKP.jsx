@@ -14,6 +14,8 @@ import {
 import axios from 'axios';
 import { useNavigate } from 'react-router-dom';
 import { config } from './config';
+import MarkdownEditor from './MarkdownEditor';
+import BudgetMatrix from './BudgetMatrix';
 
 // Адрес FastAPI бэкенда (автоматически dev/prod)
 const API_URL = config.API_URL;
@@ -141,11 +143,42 @@ export default function AgentKP() {
         if (state.status === "WAITING_FOR_HUMAN" && state.extracted_data && !data) {
           const raw = state.extracted_data;
 
-          // Преобразуем массивы объектов {text, source} в строки для редактирования
-          // При этом сохраняем оригиналы для отображения цитат
-          const extractTextArray = (arr) => {
-            if (!Array.isArray(arr)) return [];
-            return arr.map(item => typeof item === 'object' ? item.text : item);
+          // Helper: Safely extract string from different formats (string | object)
+          const safelyExtractText = (val) => {
+            if (!val) return '';
+            if (typeof val === 'string') return val;
+            if (typeof val === 'object') return val.text || '';
+            return String(val);
+          };
+
+          // Helper: Extract source from object if available
+          const safelyExtractSource = (val) => {
+            if (val && typeof val === 'object') return val.source || '';
+            return '';
+          };
+
+          // Helper: Normalize arrays (handles string/array/object mix)
+          const extractTextArray = (val) => {
+            if (!val) return [];
+            if (Array.isArray(val)) {
+              return val.map(item => typeof item === 'object' ? (item.text || '') : item);
+            }
+            if (typeof val === 'string') return [val]; // Handle single string as array
+            return [];
+          };
+
+          // Helper: Normalize to objects for _original (UI expects {text, source})
+          const normalizeToObjects = (val) => {
+            if (!val) return [];
+            let arr = [];
+            if (Array.isArray(val)) arr = val;
+            else if (typeof val === 'string') arr = [val];
+
+            return arr.map(item => {
+              if (typeof item === 'string') return { text: item, source: '' };
+              if (typeof item === 'object') return { text: item.text || '', source: item.source || '' };
+              return { text: '', source: '' };
+            });
           };
 
           // Извлечение текста из категоризированной структуры key_features
@@ -160,7 +193,7 @@ export default function AgentKP() {
             Object.values(obj).forEach(categoryArr => {
               if (Array.isArray(categoryArr)) {
                 categoryArr.forEach(item => {
-                  allTexts.push(typeof item === 'object' ? item.text : item);
+                  allTexts.push(typeof item === 'object' ? (item.text || '') : item);
                 });
               }
             });
@@ -170,12 +203,13 @@ export default function AgentKP() {
           // Преобразуем категоризированную структуру в плоский массив для отображения
           const flattenCategorizedFeatures = (obj) => {
             if (!obj || typeof obj !== 'object') return [];
-            if (Array.isArray(obj)) return obj; // Fallback для старой структуры
+            if (Array.isArray(obj)) return normalizeToObjects(obj); // Fallback for old structure
             const allItems = [];
             Object.entries(obj).forEach(([category, items]) => {
               if (Array.isArray(items)) {
                 items.forEach(item => {
-                  allItems.push({ ...item, category });
+                  const normalized = typeof item === 'string' ? { text: item, source: '' } : (item || { text: '', source: '' });
+                  allItems.push({ ...normalized, category });
                 });
               }
             });
@@ -184,6 +218,9 @@ export default function AgentKP() {
 
           const formattedData = {
             ...raw,
+            client_name: safelyExtractText(raw.client_name),
+            project_essence: safelyExtractText(raw.project_essence),
+            project_type: safelyExtractText(raw.project_type),
             business_goals: extractTextArray(raw.business_goals).join('\n'),
             key_features: extractCategorizedFeatures(raw.key_features),
             tech_stack: extractTextArray(raw.tech_stack).join('\n'),
@@ -191,6 +228,14 @@ export default function AgentKP() {
             // Сохраняем оригинальные массивы для показа цитат
             _original: {
               ...raw,
+              // Top-level fields with source
+              client_name: raw.client_name,
+              project_essence: raw.project_essence,
+              project_type: raw.project_type,
+
+              tech_stack: normalizeToObjects(raw.tech_stack),
+              business_goals: normalizeToObjects(raw.business_goals),
+              client_integrations: normalizeToObjects(raw.client_integrations),
               key_features_flat: flattenCategorizedFeatures(raw.key_features)
             }
           };
@@ -198,8 +243,8 @@ export default function AgentKP() {
 
           // Сохраняем новые данные
           setRequirementIssues(raw.requirement_issues || []);
-          setSourceExcerpts(raw.source_excerpts || {});
-          setRawText(state.raw_text || '');
+          // sourceExcerpts больше не нужны, берем из _original
+          setRawText(state.raw_text_preview || '');
           setSuggestedHours(state.suggested_hours || {});
 
           // Используем этапы и роли, предложенные ИИ
@@ -634,7 +679,7 @@ export default function AgentKP() {
                     {/* 1. КЛИЕНТ */}
                     <Paper
                       elevation={0}
-                      onClick={() => setSelectedItem({ field: 'client_name', text: data.client_name, source: sourceExcerpts.client_name })}
+                      onClick={() => setSelectedItem({ field: 'client_name', text: data.client_name, source: data._original?.client_name?.source })}
                       sx={{
                         p: 2,
                         bgcolor: selectedItem?.field === 'client_name' ? 'rgba(25, 118, 210, 0.08)' : 'white',
@@ -746,7 +791,7 @@ export default function AgentKP() {
                     {/* 3. СУТЬ ПРОЕКТА (Full Width) */}
                     <Paper
                       elevation={0}
-                      onClick={() => setSelectedItem({ field: 'project_essence', text: data.project_essence, source: sourceExcerpts.project_essence })}
+                      onClick={() => setSelectedItem({ field: 'project_essence', text: data.project_essence, source: data._original?.project_essence?.source })}
                       sx={{
                         gridColumn: '1 / -1',
                         p: 3,
@@ -1160,158 +1205,25 @@ export default function AgentKP() {
                 В запросе: "Ограничь ширину контента... для центрального блока".
                 Таблицу можно оставить широкой, но для консистентности лучше тоже 900px.
             */}
-            <Container maxWidth="md" disableGutters sx={{ mb: 4 }}>
+            <Container maxWidth="lg" disableGutters sx={{ mb: 4 }}>
 
-              {/* ТАБЛИЦА СМЕТЫ */}
-              <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
-                <Typography variant="h6" fontWeight={600}>Матрица трудозатрат</Typography>
-                <Box>
-                  <Button
-                    startIcon={<Add />}
-                    onClick={() => setOpenStageDialog(true)}
-                    sx={{ color: 'primary.main' }}
-                  >
-                    Этап
-                  </Button>
-                  <Button
-                    startIcon={<Add />}
-                    onClick={() => setOpenRoleDialog(true)}
-                    sx={{ color: 'primary.main' }}
-                  >
-                    Роль
-                  </Button>
-                </Box>
-              </Box>
+              {/* ТАБЛИЦА СМЕТЫ - новый компонент */}
+              <BudgetMatrix
+                stages={stages}
+                setStages={setStages}
+                roles={roles}
+                setRoles={setRoles}
+                budgetMatrix={budgetMatrix}
+                setBudgetMatrix={setBudgetMatrix}
+                userModified={userModified}
+                setUserModified={setUserModified}
+                suggestedHours={suggestedHours}
+                onDeleteStage={handleDeleteStage}
+                onDeleteRole={handleDeleteRole}
+              />
 
-              <TableContainer sx={{ borderRadius: 2, border: '1px solid', borderColor: 'divider', mb: 4 }}>
-                <Table size="small">
-                  <TableHead>
-                    <TableRow>
-                      <TableCell sx={{ minWidth: 150 }}>
-                        <strong>Этапы работ</strong>
-                      </TableCell>
-                      {Object.keys(roles).map(role => (
-                        <TableCell key={role} align="center" sx={{ minWidth: 120 }}>
-                          <Box display="flex" flexDirection="column" alignItems="center">
-                            <Box display="flex" alignItems="center" gap={0.5}>
-                              <Typography variant="body2" fontWeight={600}>{role}</Typography>
-                              <IconButton size="small" onClick={() => handleDeleteRole(role)} sx={{ color: 'text.secondary', p: 0.5 }}>
-                                <Delete fontSize="small" />
-                              </IconButton>
-                            </Box>
-                            <TextField
-                              type="number"
-                              variant="standard"
-                              size="small"
-                              value={roles[role]}
-                              onChange={(e) => setRoles(prev => ({ ...prev, [role]: parseInt(e.target.value) || 0 }))}
-                              InputProps={{
-                                disableUnderline: true,
-                                endAdornment: <Typography variant="caption" color="text.disabled" sx={{ fontSize: '0.65rem', ml: 0.25 }}>₽/ч</Typography>,
-                                inputProps: {
-                                  style: {
-                                    textAlign: 'center',
-                                    width: 40,
-                                    fontSize: '0.75rem',
-                                    padding: '2px 4px'
-                                  },
-                                  min: 0
-                                }
-                              }}
-                              sx={{
-                                '& input': {
-                                  p: 0.25,
-                                  bgcolor: 'grey.100',
-                                  borderRadius: 1,
-                                  '&:hover': { bgcolor: 'grey.200' },
-                                  '&:focus': { bgcolor: 'primary.50', outline: '1px solid', outlineColor: 'primary.light' }
-                                },
-                                '& .MuiInputBase-root': {
-                                  fontSize: '0.75rem'
-                                }
-                              }}
-                            />
-                          </Box>
-                        </TableCell>
-                      ))}
-                    </TableRow>
-                  </TableHead>
-                  <TableBody>
-                    {stages.map(stage => (
-                      <TableRow key={stage} hover>
-                        <TableCell component="th" scope="row" sx={{ fontWeight: 500 }}>
-                          <Box display="flex" alignItems="center" justifyContent="space-between">
-                            {stage}
-                            <IconButton size="small" onClick={() => handleDeleteStage(stage)} sx={{ color: 'text.secondary', opacity: 0.5, '&:hover': { opacity: 1 } }}>
-                              <Delete fontSize="small" />
-                            </IconButton>
-                          </Box>
-                        </TableCell>
-                        {Object.keys(roles).map(role => {
-                          const isModified = userModified[stage]?.[role];
-                          const currentValue = budgetMatrix[stage]?.[role] || 0;
-
-                          return (
-                            <TableCell key={role} align="center">
-                              <TextField
-                                type="number"
-                                variant="standard"
-                                InputProps={{
-                                  disableUnderline: true,
-                                  inputProps: {
-                                    style: {
-                                      textAlign: 'center',
-                                      color: isModified ? '#1976D2' : '#9E9E9E',
-                                      fontStyle: isModified ? 'normal' : 'italic',
-                                      fontWeight: isModified ? 600 : 400
-                                    },
-                                    min: 0
-                                  }
-                                }}
-                                sx={{
-                                  width: 60,
-                                  '& input': {
-                                    p: 1,
-                                    borderRadius: 1,
-                                    bgcolor: isModified ? 'rgba(25, 118, 210, 0.08)' : 'background.default',
-                                    transition: 'all 0.2s ease'
-                                  }
-                                }}
-                                value={currentValue}
-                                onChange={(e) => handleHourChange(stage, role, e.target.value)}
-                              />
-                            </TableCell>
-                          );
-                        })}
-                      </TableRow>
-                    ))}
-                  </TableBody>
-                </Table>
-              </TableContainer>
-
-              {/* Итоговая смета */}
-              <Paper
-                variant="outlined"
-                sx={{
-                  p: 3,
-                  bgcolor: '#FFF0E0',
-                  borderRadius: 3,
-                  borderColor: 'primary.light',
-                  display: 'flex',
-                  justifyContent: 'space-between',
-                  alignItems: 'center',
-                  flexWrap: 'wrap',
-                  gap: 2,
-                }}
-              >
-                <Box>
-                  <Typography variant="h6" color="text.primary">
-                    Итоговая смета:
-                  </Typography>
-                  <Typography variant="h4" color="primary.main" fontWeight="bold">
-                    {calculateTotal().toLocaleString('ru-RU')} ₽
-                  </Typography>
-                </Box>
+              {/* Кнопка утверждения */}
+              <Box display="flex" justifyContent="flex-end" mt={3}>
                 <Button
                   variant="contained"
                   size="large"
@@ -1319,8 +1231,9 @@ export default function AgentKP() {
                   startIcon={<CheckCircle />}
                   sx={{ px: 5, py: 1.5 }}
                 >
+                  Утвердить и сгенерировать КП
                 </Button>
-              </Paper>
+              </Box>
             </Container>
           </Paper >
         )
@@ -1337,26 +1250,71 @@ export default function AgentKP() {
                 </Typography>
               </Box>
 
-              <Paper
-                elevation={0}
-                variant="outlined"
-                sx={{
-                  p: 3,
-                  borderRadius: 2,
-                  bgcolor: 'white',
-                }}
-              >
-                <TextField
-                  fullWidth
-                  multiline
-                  minRows={10}
-                  maxRows={30}
-                  variant="outlined"
-                  value={finalDoc || ''}
-                  onChange={(e) => setFinalDoc(e.target.value)}
-                  sx={{ mb: 2 }}
-                />
-              </Paper>
+
+              <Box sx={{ minHeight: 500 }}>
+                {(() => {
+                  // --- ГЕНЕРАЦИЯ ДАННЫХ ДЛЯ ШАБЛОНОВ ---
+                  const totalBudget = Object.keys(budgetMatrix).reduce((sum, stage) => {
+                    return sum + Object.keys(roles).reduce((s, role) => {
+                      return s + (budgetMatrix[stage]?.[role] || 0) * roles[role];
+                    }, 0);
+                  }, 0);
+
+                  // 1. Таблица сметы
+                  let budgetTable = "| Этап | Роль | Часы | Ставка | Сумма |\n|---|---|---|---|---|\n";
+                  Object.keys(budgetMatrix).forEach(stage => {
+                    const stageRoles = budgetMatrix[stage] || {};
+                    let hasRoles = false;
+                    Object.keys(stageRoles).forEach(role => {
+                      const hours = stageRoles[role];
+                      if (hours > 0) {
+                        hasRoles = true;
+                        const rate = roles[role];
+                        budgetTable += `| ${stage} | ${role} | ${hours} | ${rate} ₽ | ${hours * rate} ₽ |\n`;
+                      }
+                    });
+                    // Если на этапе нет часов, можно добавить пустую строку или пропустить
+                  });
+                  budgetTable += `| **ИТОГО** | | | | **${totalBudget} ₽** |`;
+
+                  // 2. Таблица этапов
+                  let stagesTable = "| Этап | Описание |\n|---|---|\n";
+                  stages.forEach(stage => {
+                    // Можно добавить часы или просто список
+                    const stageHours = Object.keys(roles).reduce((acc, r) => acc + (budgetMatrix[stage]?.[r] || 0), 0);
+                    stagesTable += `| ${stage} | ${stageHours} ч. |\n`;
+                  });
+
+                  // 3. Таблица команды
+                  let teamTable = "| Роль | Ставка |\n|---|---|\n";
+                  Object.entries(roles).forEach(([role, rate]) => {
+                    teamTable += `| ${role} | ${rate} ₽/час |\n`;
+                  });
+
+                  return (
+                    <MarkdownEditor
+                      value={finalDoc || ''}
+                      onChange={setFinalDoc}
+                      data={{
+                        client_name: data?.client_name || '',
+                        project_type: data?.project_type || '',
+                        project_essence: data?.project_essence || '',
+                        business_goals: data?.business_goals || '',
+                        key_features: data?.key_features || '',
+                        tech_stack: data?.tech_stack || '',
+                        integrations: data?.client_integrations || '',
+                        date: new Date().toLocaleDateString('ru-RU'),
+                        // Calculated fields
+                        total_budget: totalBudget,
+                        budget_table: budgetTable,
+                        stages_table: stagesTable,
+                        team_table: teamTable,
+                        timeline: 'По согласованию' // Placeholder
+                      }}
+                    />
+                  );
+                })()}
+              </Box>
 
               <Box display="flex" gap={2} mt={3}>
                 <Button
