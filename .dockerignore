@@ -21,4 +21,6 @@ extract_tables.py
 
 extract_tables.py
 
+lancedb_data
+shared_data
 *.exe

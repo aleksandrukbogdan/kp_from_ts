@@ -167,4 +167,7 @@ project.tar.gz
 
 extract_tables.py
 
+lancedb_data
+shared_data
+
 *.exe

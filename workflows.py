@@ -9,9 +9,11 @@ from activities import (
     generate_proposal_activity,
     save_budget_stub,
     ocr_document_activity,
-    split_text_activity,
+    index_document_activity,
     extract_chunk_activity,
     merge_data_activity,
+    analyze_requirements_chunk_activity,
+    refine_requirements_activity,
     analyze_project_activity
 )
 
@@ -29,6 +31,7 @@ class ProposalWorkflow:
         self.suggested_hours = None  # AI Suggestions
         self.suggested_stages = None  # AI Suggestions
         self.suggested_roles = None  # AI Suggestions
+        self.requirements_analysis = None # List[RequirementAnalysisItem]
     
     @workflow.query
     def get_data(self):
@@ -40,7 +43,8 @@ class ProposalWorkflow:
             "raw_text_length": self.raw_text_length,
             "suggested_hours": self.suggested_hours,
             "suggested_stages": self.suggested_stages,
-            "suggested_roles": self.suggested_roles
+            "suggested_roles": self.suggested_roles,
+            "requirements_analysis": self.requirements_analysis
         }
     
     @workflow.signal
@@ -77,12 +81,12 @@ class ProposalWorkflow:
         # Set placeholder preview
         self.raw_text_preview = f"File processed successfully. Path: {md_file_path}"
         
-        # 3. Splitting Text - Returns list of ChunkDefs (dicts)
+        # 3. Indexing & Splitting - Returns list of ChunkDefs (dicts) AND creates LanceDB index
         chunks_defs = await workflow.execute_activity(
-            split_text_activity,
+            index_document_activity,
             args=[md_file_path],
             task_queue="proposal-queue",
-            start_to_close_timeout=timedelta(minutes=2)
+            start_to_close_timeout=timedelta(minutes=5)
         )
         
         if not chunks_defs:
@@ -94,28 +98,70 @@ class ProposalWorkflow:
         # 4. Parallel Extraction (Map Phase) - BATCHED
         # User requested speedup but GPU is at 96% load.
         # BATCH_SIZE = 3 (Safe start)
-        BATCH_SIZE = 3
+        # Optimization: With larger chunks (50k chars), we lower concurrency to avoid OOM.
+        BATCH_SIZE = 1
         partial_results = []
+        all_requirements = []
         
         for i in range(0, len(chunks_defs), BATCH_SIZE):
             batch_chunks = chunks_defs[i : i + BATCH_SIZE]
             
+            # Phase 1: Basic Extraction
             extract_futures = [
                 workflow.execute_activity(
                     extract_chunk_activity,
                     args=[chunk_def],
-                    task_queue="gpu-queue", # Processing on GPU/LLM worker
+                    task_queue="gpu-queue", 
+                    start_to_close_timeout=timedelta(minutes=60)
+                )
+                for chunk_def in batch_chunks
+            ]
+
+            # Phase 1.5: Detailed Requirements Analysis
+            analysis_futures = [
+                workflow.execute_activity(
+                    analyze_requirements_chunk_activity,
+                    args=[chunk_def],
+                    task_queue="gpu-queue",
                     start_to_close_timeout=timedelta(minutes=60)
                 )
                 for chunk_def in batch_chunks
             ]
             
-            # Wait for the current batch to finish before scheduling the next
-            # Aggressive parallelism here could OOM the VRAM if batch size is too high
-            batch_results = await asyncio.gather(*extract_futures)
-            partial_results.extend(batch_results)
+            # Run both sets of tasks
+            # Results will be a list containing results of extraction AND analysis
+            # We need to handle them carefully. 
+            # asyncio.gather returns results in order of futures.
+            
+            # Let's run them as two separate groups but concurrently if possible?
+            # actually, just awaiting them in one gather is fine if we split the lists back.
+            
+            results_extract = await asyncio.gather(*extract_futures)
+            results_analysis = await asyncio.gather(*analysis_futures)
+
+            partial_results.extend(results_extract)
+            for sublist in results_analysis:
+                all_requirements.extend(sublist)
+            
+        # Phase 3: Reverse RAG Refinement
+        # Enriches the analysis with exact source text
+        # Filter out any lingering None values to prevent decoder errors
+        all_requirements = [r for r in all_requirements if r is not None]
+
+        if all_requirements:
+             unique_requirements = await workflow.execute_activity(
+                refine_requirements_activity,
+                args=[all_requirements],
+                task_queue="gpu-queue", # Using GPU for embeddings
+                start_to_close_timeout=timedelta(minutes=10)
+             )
+             self.requirements_analysis = unique_requirements
+        else:
+             self.requirements_analysis = []
         
         # 5. Merge (Reduce Phase)
+        partial_results = [r for r in partial_results if r is not None]
+        
         merged_data_dict = await workflow.execute_activity(
             merge_data_activity,
             args=[partial_results],
@@ -126,7 +172,7 @@ class ProposalWorkflow:
         # 6. Analysis (Phase 2 - using Aggregated Data)
         self.extracted_data = await workflow.execute_activity(
             analyze_project_activity,
-            args=[merged_data_dict],
+            args=[merged_data_dict, self.requirements_analysis or []],
             task_queue="gpu-queue",
             start_to_close_timeout=timedelta(minutes=10)
         )

@@ -52,14 +52,17 @@ services:
     volumes:
       - ./shared_data:/shared_data
       - ./:/app
-    #deploy:
-    #  resources:
-    #    reservations:
-    #      devices:
-    #        - driver: nvidia
-    #          device_ids: [ '0' ] # GPU 0 (первая H100)
-    #          capabilities: [ gpu ]
-    # 4. Temporal Server
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+        reservations:
+          memory: 4G
+          # devices:
+          #   - driver: nvidia
+          #     count: 1
+          #     capabilities: [gpu]
+          # 4. Temporal Server
   temporal-server:
     image: temporalio/admin-tools:latest
     container_name: temporal_server

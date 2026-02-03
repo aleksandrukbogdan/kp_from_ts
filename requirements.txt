@@ -4,10 +4,11 @@ openai
 python-docx
 PyPDF2
 temporalio
-pandas
+
 flask
 fastapi
 python-multipart
 markdown
 beautifulsoup4
 docling
+

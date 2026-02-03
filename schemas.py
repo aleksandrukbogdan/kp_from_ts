@@ -62,6 +62,8 @@ def string_to_source_text(v: Any) -> Any:
 # --- Pydantic Models for Structured Output ---
 class SourceText(BaseModel):
     text: str = Field(description="Текст значения (Описание требования или технологии). НА РУССКОМ ЯЗЫКЕ.")
+    source_quote: Optional[str] = Field(default=None, description="Цитата из исходного текста, подтверждающая требование.")
+    page_number: Optional[int] = Field(default=None, description="Номер страницы с цитатой.")
 
 
 class KeyFeaturesDetails(BaseModel):
@@ -231,6 +233,23 @@ class StageEstimate(BaseModel):
 
 class BudgetResult(BaseModel):
     stages: List[StageEstimate] = Field(default_factory=list)
+
+
+# --- Phase 1.5 Models (Detailed Analysis) ---
+class RequirementAnalysisItem(BaseModel):
+    category: str = Field(description="Тип требования (например: Безопасность, Интерфейс, Бэкенд, Бизнес-логика)")
+    summary: str = Field(description="Краткое, четкое описание требования своими словами (для менеджера)")
+    search_query: str = Field(description="Уникальный фрагмент текста из источника для векторного поиска (для BGE-M3)")
+    importance: Literal["Высокая", "Средняя", "Низкая"] = Field(description="Важность требования")
+    
+    # RAG Enriched Fields (Filled later)
+    source_text: Optional[str] = Field(default=None, description="Найденный 'Reverse RAG' текст из документа")
+    page_number: Optional[int] = Field(default=None, description="Номер страницы")
+    bbox: Optional[str] = Field(default=None, description="Координаты BBox на странице")
+    confidence_score: Optional[float] = Field(default=None, description="Оценка уверенности поиска")
+
+class RequirementAnalysisResult(BaseModel):
+    items: List[RequirementAnalysisItem] = Field(default_factory=list)
 
 class ProposalResult(BaseModel):
     markdown_content: str = Field(description="Markdown текст КП")

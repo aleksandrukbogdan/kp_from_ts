@@ -1,0 +1,7 @@
+
+# Heavy dependencies (Cached Layer)
+torch
+sentence-transformers
+numpy
+pandas
+lancedb

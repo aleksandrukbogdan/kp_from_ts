@@ -7,10 +7,12 @@ from activities import (
     generate_proposal_activity,
     save_budget_stub,
     ocr_document_activity,
-    split_text_activity,
+    index_document_activity, # Replaced split_text
     extract_chunk_activity,
     merge_data_activity,
-    analyze_project_activity
+    analyze_project_activity,
+    analyze_requirements_chunk_activity, # New
+    refine_requirements_activity # New
 )
 from workflows import ProposalWorkflow
 
@@ -24,7 +26,7 @@ async def main():
         activities=[
             parse_file_activity, 
             save_budget_stub, 
-            split_text_activity, 
+            index_document_activity, # Replaced split_text
             merge_data_activity
         ]
     )
@@ -39,7 +41,9 @@ async def main():
             estimate_hours_activity, 
             generate_proposal_activity,
             extract_chunk_activity,
-            analyze_project_activity
+            analyze_project_activity,
+            analyze_requirements_chunk_activity, # New (LLM)
+            refine_requirements_activity # New (Embeddings/Search)
         ]
     )
     print("Workers started")

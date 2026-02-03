@@ -20,7 +20,9 @@ from schemas import (
     BudgetResult, 
     ProposalResult, 
     KeyFeaturesDetails,
-    SourceText
+    SourceText,
+    RequirementAnalysisResult,
+    RequirementAnalysisItem
 )
 from utils_text import split_markdown, merge_extracted_data
 
@@ -112,8 +114,20 @@ async def parse_file_activity(file_path:str, file_name:str) -> str:
     md_filename = f"{input_path.stem}_parsed.md"
     md_path = input_path.parent / md_filename
     
+    # Save Markdown
     with open(md_path, "w", encoding="utf-8") as f:
         f.write(markdown_text)
+
+    # Save Docling JSON (for RAG Metadata)
+    try:
+        json_filename = f"{input_path.stem}_parsed.json"
+        json_path = input_path.parent / json_filename
+        # docling export_to_dict returns a dict, needed for detailed layout info
+        doc_dict = result.document.export_to_dict()
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(doc_dict, f, ensure_ascii=False, default=str)
+    except Exception as e:
+        activity.logger.error(f"Failed to save Docling JSON: {e}")
         
     return str(md_path)
 
@@ -260,8 +274,10 @@ async def generate_proposal_activity(data: dict, budget_matrix: dict, rates: dic
 
 def _split_text_sync(md_file_path: str) -> List[Dict[str, Any]]:
     """Sync implementation of splitting to be run in thread. Uses BYTES to avoid seek issues."""
-    CHUNK_SIZE = 12000 # Bytes approximately
-    OVERLAP = 1000     # Bytes
+    # Optimization: Increased default chunk size for large-context models (e.g. Qwen3-VL 128k)
+    # 50,000 bytes ~ 15k tokens. Safe for 32k+ context windows.
+    CHUNK_SIZE = int(os.getenv("DOC_CHUNK_SIZE", 50000))
+    OVERLAP = int(os.getenv("DOC_CHUNK_OVERLAP", 2000))
     
     chunks_defs = []
     
@@ -323,13 +339,130 @@ def _split_text_sync(md_file_path: str) -> List[Dict[str, Any]]:
         return []
 
 @activity.defn
-async def split_text_activity(md_file_path: str) -> List[Dict[str, Any]]:
+async def index_document_activity(md_file_path: str) -> List[Dict[str, Any]]:
     """
-    Reads the markdown file and defines chunks.
-    Returns a list of Chunk Definitions: {'file_path': str, 'start': int, 'end': int}
+    1. Splits markdown for LLM processing (returning chunk defs).
+    2. Indexes the rich content (JSON) into LanceDB for RAG.
     """
-    # Offload to thread to avoid Heartbeat timeout on large files
-    return await asyncio.to_thread(_split_text_sync, md_file_path)
+    # 1. Standard Split for LLM (keep existing logic)
+    chunks_defs = await asyncio.to_thread(_split_text_sync, md_file_path)
+    
+    # 2. RAG Indexing
+    def _run_indexing():
+        try:
+            # Look for the JSON file we saved earlier
+            input_path = Path(md_file_path)
+            json_path = input_path.parent / f"{input_path.stem.replace('_parsed', '')}_parsed.json"
+            
+            rag_chunks = []
+            
+            if json_path.exists():
+                with open(json_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    
+                # Iterate over Docling structure to create RAG chunks
+                # Docling dict structure: 'pages', 'texts' or 'main_text'
+                # Simplified approach: Iterate 'texts' if available or fallback to parsing the MD logic again
+                # Assuming 'texts' contains paragraph-level info with provenance
+                
+                # If Docling export format is complex, we might just chunk the tokens. 
+                # For this MVP: Use the 'texts' array if present, usually distinct elements.
+                if 'texts' in data:
+                     for item in data['texts']:
+                         # item structure depends on version, usually {'text': '...', 'prov': [{'page_no': 1, 'bbox': ...}]}
+                         text_content = item.get('text', '').strip()
+                         if len(text_content) > 20: # Skip noise
+                             prov_list = item.get('prov') or [{}]
+                             prov = prov_list[0]
+                             rag_chunks.append({
+                                 "text": text_content,
+                                 "page_number": prov.get('page_no', 1),
+                                 "bbox": str(prov.get('bbox', [])),
+                                 "source_file": str(input_path.name)
+                             })
+            
+            # Fallback if no JSON or empty: Chunk the MD lines
+            if not rag_chunks:
+                activity.logger.warning("No structured JSON found for RAG. Using text chunks.")
+                # We can reuse the chunks_defs logic but we need the actual text
+                with open(md_file_path, "r", encoding="utf-8") as f:
+                    full_text = f.read()
+                
+                # Create simple chunks
+                for c in chunks_defs:
+                    txt = full_text[c['start']:c['end']]
+                    rag_chunks.append({
+                        "text": txt,
+                        "page_number": 0,
+                        "bbox": "",
+                        "source_file": str(input_path.name)
+                    })
+
+            # Create Index
+            from rag_service import RAGService
+            rag = RAGService()
+            # Use workflow_id as the table name for isolation
+            wf_id = activity.info().workflow_execution.workflow_id
+            # Sanitize just in case, though Temporal IDs are usually safe strings
+            table_name = f"req_{wf_id.replace('-', '_')}"
+            
+            rag.create_index(chunks=rag_chunks, table_name=table_name)
+            
+            return {
+                "status": "indexed", 
+                "chunks_count": len(rag_chunks),
+                "table_name": table_name
+            }
+        except Exception as e:
+            activity.logger.error(f"Indexing Failed: {e}")
+            return {
+                "status": "failed",
+                "chunks_count": 0,
+                "table_name": None,
+                "error": str(e)
+            }
+            
+    await asyncio.to_thread(_run_indexing)
+    
+    return chunks_defs
+
+@activity.defn
+async def refine_requirements_activity(requirements: List[dict]) -> List[dict]:
+    """
+    Phase 3: Reverse RAG.
+    Enriches requirements with exact source text via Vector Search.
+    """
+    from rag_service import RAGService
+    rag = RAGService()
+    wf_id = activity.info().workflow_execution.workflow_id
+    table_name = f"req_{wf_id.replace('-', '_')}"
+    
+    refined_list = []
+    
+    for item_dict in requirements:
+        try:
+            # Rehydrate model
+            item = RequirementAnalysisItem(**item_dict)
+            
+            if item.search_query:
+                matches = await asyncio.to_thread(rag.search, item.search_query, table_name=table_name, top_k=1)
+                
+                if matches:
+                    top_match = matches[0]
+                    # Update Item
+                    item.source_text = top_match.get('text', '')
+                    item.page_number = top_match.get('page_number')
+                    item.bbox = top_match.get('bbox')
+                    # LanceDB returns '_distance' usually, convert to score if needed
+                    item.confidence_score = 0.95 # Mock/Placeholder or calc from distance
+            
+            refined_list.append(item.model_dump())
+            
+        except Exception as e:
+            activity.logger.error(f"Refinement Failed for item: {e}")
+            refined_list.append(item_dict) # Keep original on error
+
+    return refined_list
 
 @activity.defn
 async def extract_chunk_activity(chunk_def: Dict[str, Any]) -> dict:
@@ -362,7 +495,7 @@ async def extract_chunk_activity(chunk_def: Dict[str, Any]) -> dict:
 Шаг 2: ИЗВЛЕЧЕНИЕ (Extraction)
 Заполни остальные поля JSON.
 - client_name: Ищи название компании-заказчика. Если не найдено, верни пустую строку "".
-- project_type: Выбери один вариант, который ЛУЧШЕ ВСЕГО подходит: [Web, Mobile, ERP, CRM, AI, Integration, Other].
+- project_type: Выбери один вариант, который ЛУЧШЕ ВСЕГО подходит: [Web, Mobile, ERP, CRM, AI, Интеграции, Прочее].
     - Если система обрабатывает документы - скорее всего ERP или AI (если есть LLM).
     - Если это мобильное приложение - Mobile.
     - Если сайт - Web.
@@ -384,8 +517,63 @@ async def extract_chunk_activity(chunk_def: Dict[str, Any]) -> dict:
         return extracted_data.model_dump()
     except Exception as e:
         activity.logger.error(f"Chunk Extraction Failed: {e}")
-        # Return empty structure - soft failure, workflow continues
-        return ExtractedTZData().model_dump()
+
+@activity.defn
+async def analyze_requirements_chunk_activity(chunk_def: Dict[str, Any]) -> List[dict]:
+    """
+    Phase 1.5: Detailed Requirements Analysis (Reverse RAG).
+    Extracts functional/non-functional requirements with search queries.
+    """
+    llm = LLMService()
+    try:
+        file_path = chunk_def["file_path"]
+        start = chunk_def["start"]
+        end = chunk_def["end"]
+        
+        chunk_text = ""
+        # OPEN AS BYTES
+        with open(file_path, "rb") as f:
+            f.seek(start)
+            chunk_bytes = f.read(end - start)
+            chunk_text = chunk_bytes.decode('utf-8', errors='ignore')
+
+        activity.logger.info(f"Analyzing requirements in chunk ({len(chunk_text)} chars)...")
+        
+        system_prompt = """Ты — ведущий системный аналитик и эксперт по технической документации. Твоя задача — анализировать фрагменты Технического Задания (ТЗ) и извлекать из них ключевые требования, риски и ограничения.
+
+Ты работаешь в архитектуре "Reverse RAG". Это значит, что для каждого найденного пункта ты должен предоставить не только анализ, но и специальный поисковый запрос (`search_query`), который позволит алгоритму найти точное место в исходном тексте.
+
+### Твои инструкции:
+1.  **Анализ:** Внимательно прочитай входящий фрагмент текста. Выдели:
+    * Функциональные требования (что система должна делать).
+    * Нефункциональные требования (SLA, безопасность, стек, нагрузка).
+    * Риски и ограничения (бюджет, сроки, юридические аспекты).
+
+2.  **Генерация Search Query (Самое важное):**
+    * Для каждого пункта создай поле `search_query`.
+    * Это должна быть **дословная или максимально близкая к тексту фраза** из исходника, подтверждающая твой анализ.
+    * Цель этого запроса — найти соответствующий вектор в базе данных (cosine similarity) (используется BGE-M3).
+    * Избегай общих слов. Ищи уникальные формулировки, цифры, названия технологий или специфические термины, упомянутые в тексте.
+
+3.  **Формат ответа:**
+    * Отвечай СТРОГО в формате JSON списка.
+    """
+
+        result: RequirementAnalysisResult = await llm.create_structured_completion(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Проанализируй следующий фрагмент ТЗ и верни JSON согласно системной инструкции.\n\n=== НАЧАЛО ФРАГМЕНТА ===\n{chunk_text}\n=== КОНЕЦ ФРАГМЕНТА ==="}
+            ],
+            output_model=RequirementAnalysisResult,
+            tool_name="analyze_requirements"
+        )
+        
+        return [item.model_dump() for item in result.items if item is not None]
+
+    except Exception as e:
+        activity.logger.error(f"Requirements Analysis Failed: {e}")
+        return []
+
 
 @activity.defn
 async def merge_data_activity(data_list: List[dict]) -> dict:
@@ -400,7 +588,7 @@ async def merge_data_activity(data_list: List[dict]) -> dict:
         return ExtractedTZData(project_essence=SourceText(text=f"Merge Error: {e}")).model_dump()
 
 @activity.defn
-async def analyze_project_activity(merged_data: dict) -> dict:
+async def analyze_project_activity(merged_data: dict, requirements_analysis: List[dict] = []) -> dict:
     """
     Phase 2: Analysis based on aggregated data.
     Populates requirement_issues, suggested_stages, suggested_roles, and estimates.
@@ -420,6 +608,14 @@ async def analyze_project_activity(merged_data: dict) -> dict:
     }
     
     context_json = json.dumps(condensed_data, indent=2, ensure_ascii=False)
+    
+    # Prepare RAG context (simplified)
+    rag_context = ""
+    if requirements_analysis:
+        rag_context = "\n=== DETAILED REQUIREMENTS WITH PROOF (RAG) ===\n"
+        for i, item in enumerate(requirements_analysis[:50]): # Limit to top 50 to avoid context overflow
+            rag_context += f"{i+1}. {item.get('summary')} (Page {item.get('page_number')})\n"
+            rag_context += f"   Proof: \"{item.get('source_text', '')[:200]}...\"\n"
     # END OPTIMIZATION
     
     try:
@@ -431,6 +627,8 @@ async def analyze_project_activity(merged_data: dict) -> dict:
 Данные проекта (извлеченные из ТЗ):
 {context_json}
 
+{rag_context}
+
 Задачи:
 1. Найди проблемные требования (неясные, противоречивые) в extracted data.
 2. Предложи этапы разработки и роли.
@@ -440,6 +638,12 @@ async def analyze_project_activity(merged_data: dict) -> dict:
 - Поле "item_text" должно содержать ТОЛЬКО текст требования (например: "Система должна работать офлайн"). 
 - НЕ пиши туда JSON или Python-объекты вроде "text='...' source='...'".
 - Если проблема общая, напиши суть своими словами.
+
+ВАЖНО ДЛЯ key_features (INTELLIGENT MERGE):
+- Теперь у тебя есть "DETAILED REQUIREMENTS WITH PROOF".
+- Когда ты формируешь список `key_features`, старайся находить соответствия в RAG-данных.
+- Если находишь — добавляй `source_quote` (цитату) и `page_number` в объект key_feature.
+- Если функция уникальна и подтверждена цитатой, это повышает доверие!
                 """}
             ],
             output_model=AnalysisTZResult,

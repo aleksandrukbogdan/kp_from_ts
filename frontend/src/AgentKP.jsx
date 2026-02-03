@@ -61,6 +61,7 @@ export default function AgentKP() {
 
   // --- Новые состояния для фич ---
   const [requirementIssues, setRequirementIssues] = useState([]);
+  const [detailedRequirements, setDetailedRequirements] = useState([]); // RAG Analysis
   const [sourceExcerpts, setSourceExcerpts] = useState({});
   const [rawText, setRawText] = useState('');
   const [suggestedHours, setSuggestedHours] = useState({});
@@ -243,6 +244,7 @@ export default function AgentKP() {
 
           // Сохраняем новые данные
           setRequirementIssues(raw.requirement_issues || []);
+          setDetailedRequirements(state.requirements_analysis || []);
           // sourceExcerpts больше не нужны, берем из _original
           setRawText(state.raw_text_preview || '');
           setSuggestedHours(state.suggested_hours || {});
@@ -1102,6 +1104,53 @@ export default function AgentKP() {
                       />
                     </Paper>
 
+                    {/* 7. ДЕТАЛЬНЫЙ АНАЛИЗ (RAG) */}
+                    {detailedRequirements.length > 0 && (
+                      <Paper elevation={0} sx={{ gridColumn: '1 / -1', p: 3, bgcolor: '#E3F2FD', borderRadius: 3, border: '1px solid', borderColor: '#90CAF9' }}>
+                        <Box display="flex" alignItems="center" gap={1} mb={2}>
+                          <CheckCircle sx={{ color: '#1976D2' }} />
+                          <Typography variant="h6" fontWeight={600} color="#0D47A1">
+                            Детальный анализ требований (Reverse RAG)
+                          </Typography>
+                        </Box>
+
+                        <Box display="flex" flexWrap="wrap" gap={1}>
+                          {detailedRequirements.map((item, idx) => {
+                            const isSelected = selectedItem?.field === 'detailed_req' && selectedItem?.text === item.summary;
+                            return (
+                              <Chip
+                                key={idx}
+                                label={item.summary}
+                                onClick={() => setSelectedItem({
+                                  field: 'detailed_req',
+                                  text: item.summary,
+                                  source: item.source_text,
+                                  // Custom metadata for Side Panel
+                                  meta: {
+                                    page: item.page_number,
+                                    score: item.confidence_score,
+                                    category: item.category,
+                                    importance: item.importance
+                                  }
+                                })}
+                                variant={isSelected ? 'filled' : 'outlined'}
+                                color="primary"
+                                sx={{
+                                  bgcolor: isSelected ? 'primary.main' : 'white',
+                                  color: isSelected ? 'white' : 'primary.main', // Explicit contrast
+                                  borderColor: isSelected ? 'primary.main' : '#BBDEFB',
+                                  '&:hover': {
+                                    bgcolor: isSelected ? 'primary.dark' : '#BBDEFB',
+                                    color: isSelected ? 'white' : 'primary.dark'
+                                  }
+                                }}
+                              />
+                            );
+                          })}
+                        </Box>
+                      </Paper>
+                    )}
+
                   </Box>
                 </Container>
               </Box>
@@ -1117,7 +1166,7 @@ export default function AgentKP() {
                   maxHeight: 'calc(100vh - 100px)',
                   overflow: 'auto',
                   minWidth: 350,
-                  zIndex: 10
+                  zIndex: 1
                 }}
               >
                 <Paper
@@ -1127,7 +1176,9 @@ export default function AgentKP() {
                     bgcolor: '#F5F5F5',
                     borderRadius: 2,
                     border: '1px solid',
-                    borderColor: 'divider'
+                    borderColor: 'divider',
+                    // Prevent overlapping
+                    maxWidth: 350
                   }}
                 >
                   <Typography variant="subtitle2" color="text.secondary" sx={{ mb: 2, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
@@ -1142,6 +1193,19 @@ export default function AgentKP() {
                         color="primary"
                         sx={{ mb: 1.5, textTransform: 'capitalize' }}
                       />
+
+                      {/* RAG Metadata Badge */}
+                      {selectedItem.meta && (
+                        <Box display="inline-flex" gap={1} ml={1} mb={1.5} alignItems="center">
+                          {selectedItem.meta.page && (
+                            <Chip label={`Стр. ${selectedItem.meta.page}`} size="small" variant="outlined" color="default" />
+                          )}
+                          {selectedItem.meta.category && (
+                            <Chip label={selectedItem.meta.category} size="small" variant="outlined" color="secondary" />
+                          )}
+                        </Box>
+                      )}
+
                       <Typography variant="body2" sx={{ mb: 1.5, fontWeight: 500 }}>
                         {selectedItem.text}
                       </Typography>
