@@ -28,6 +28,10 @@ os.makedirs(SHARED_DIR, exist_ok=True)
 
 app = FastAPI(title="Agent KP API")
 
+# Prometheus metrics for monitoring
+from prometheus_fastapi_instrumentator import Instrumentator
+Instrumentator().instrument(app).expose(app)
+
 # Динамически определяем адрес сервера
 IS_DEV = os.getenv('IS_DEV', 'false').lower() == 'true'
 SERVER_ADDRESS = 'localhost' if IS_DEV else '10.109.50.250'

@@ -3,19 +3,28 @@ import {
     Box, Paper, Typography, TextField, IconButton, Tooltip, Chip,
     Table, TableBody, TableCell, TableContainer, TableHead, TableRow,
     Button, Dialog, DialogTitle, DialogContent, DialogActions,
-    Switch, FormControlLabel, Slider, Collapse, Alert, Divider
+    Slider, Collapse, Alert, Divider
 } from '@mui/material';
 import {
     Add, Delete, Warning, TrendingUp, CompareArrows,
     ExpandMore, ExpandLess, Timeline
 } from '@mui/icons-material';
-import { PieChart, Pie, Cell, BarChart, Bar, XAxis, YAxis, Tooltip as RechartsTooltip, ResponsiveContainer, Legend } from 'recharts';
+import { PieChart, Pie, Cell, Tooltip as RechartsTooltip, ResponsiveContainer } from 'recharts';
 
-// Цвета для ролей
+// Material 3 harmonized palette with #FF6B00
 const ROLE_COLORS = [
-    '#6750A4', '#0061A4', '#006E1C', '#BA1A1A', '#5D5F5F',
-    '#7C5800', '#006874', '#8B5CF6', '#EC4899', '#10B981'
+    '#FF6B00', // Primary Orange
+    '#455A64', // Slate (грифельный)
+    '#00796B', // Teal (тиловый)
+    '#5D4037', // Brown (тёплый нейтральный)
+    '#607D8B', // Blue-grey (приглушенный синий)
+    '#BF360C', // Deep Orange (тёмно-кирпичный)
+    '#37474F', // Dark Slate
+    '#004D40', // Dark Teal
 ];
+
+// Часов в неделе для расчёта длительности Gantt
+const HOURS_PER_WEEK = 40;
 
 // Получить цвет ячейки по количеству часов
 const getCellColor = (hours) => {
@@ -57,6 +66,11 @@ export default function BudgetMatrix({
     const [showGantt, setShowGantt] = useState(false);
     const [showStats, setShowStats] = useState(true);
     const [editingRisk, setEditingRisk] = useState(null);
+
+    // Gantt: смещение начала каждого этапа (в неделях)
+    const [stageOffsets, setStageOffsets] = useState({});
+    // Для подсветки при hover
+    const [hoveredStage, setHoveredStage] = useState(null);
 
     // Диалоги
     const [openRoleDialog, setOpenRoleDialog] = useState(false);
@@ -162,13 +176,46 @@ export default function BudgetMatrix({
     }, [calculations.roleHours]);
 
     const ganttData = useMemo(() => {
-        return stages.map((stage, idx) => ({
-            name: stage,
-            hours: calculations.stageHours[stage] || 0,
-            risk: riskCoefficients[stage] || 1,
-            fill: ROLE_COLORS[idx % ROLE_COLORS.length]
+        let cumulativeOffset = 0;
+        return stages.map((stage, idx) => {
+            const stageRoleHours = budgetMatrix[stage] || {};
+            const totalHours = calculations.stageHours[stage] || 0;
+
+            // Option C: Рассчитываем длительность на основе параллельности ролей
+            // Ищем максимальные часы среди всех ролей на этапе
+            const maxRoleHours = Math.max(...Object.values(stageRoleHours), 0);
+            // Длительность = макс. часы / часов в неделю (округляем вверх, минимум 1)
+            const duration = Math.max(1, Math.ceil(maxRoleHours / HOURS_PER_WEEK));
+
+            // Используем сохранённое смещение или кумулятивное
+            const startOffset = stageOffsets[stage] ?? cumulativeOffset;
+            cumulativeOffset = startOffset + duration;
+
+            return {
+                name: stage,
+                hours: totalHours,
+                maxRoleHours,
+                duration,
+                startOffset,
+                endOffset: startOffset + duration,
+                risk: riskCoefficients[stage] || 1,
+                fill: '#78909C', // Neutral blue-grey
+            };
+        });
+    }, [stages, budgetMatrix, calculations.stageHours, stageOffsets, riskCoefficients]);
+
+    // Максимальная длина шкалы (для X-axis)
+    const maxWeeks = useMemo(() => {
+        return Math.max(...ganttData.map(d => d.endOffset), 4);
+    }, [ganttData]);
+
+    // Обработчик перетаскивания этапов в Gantt
+    const handleStageOffsetChange = useCallback((stageName, newOffset) => {
+        setStageOffsets(prev => ({
+            ...prev,
+            [stageName]: Math.max(0, Math.round(newOffset))
         }));
-    }, [stages, calculations.stageHours, riskCoefficients]);
+    }, []);
 
     // Сравнение с AI
     const getDiff = useCallback((stage, role) => {
@@ -185,20 +232,71 @@ export default function BudgetMatrix({
                     Матрица трудозатрат
                 </Typography>
                 <Box display="flex" gap={1} alignItems="center">
-                    <FormControlLabel
-                        control={<Switch size="small" checked={showComparison} onChange={(e) => setShowComparison(e.target.checked)} />}
-                        label={<Typography variant="caption">Сравнить с AI</Typography>}
+                    {/* Segmented Button style toggles */}
+                    <Chip
+                        label="Сравнить с AI"
+                        icon={<CompareArrows sx={{ fontSize: 16 }} />}
+                        onClick={() => setShowComparison(!showComparison)}
+                        variant={showComparison ? 'filled' : 'outlined'}
+                        size="small"
+                        sx={{
+                            bgcolor: showComparison ? '#FF6B00' : 'transparent',
+                            color: showComparison ? 'white' : 'text.primary',
+                            borderColor: showComparison ? '#FF6B00' : 'divider',
+                            '&:hover': { bgcolor: showComparison ? '#E65100' : 'action.hover' },
+                            '& .MuiChip-icon': { color: showComparison ? 'white' : 'text.secondary' }
+                        }}
                     />
-                    <FormControlLabel
-                        control={<Switch size="small" checked={showGantt} onChange={(e) => setShowGantt(e.target.checked)} />}
-                        label={<Typography variant="caption">Gantt</Typography>}
+                    <Chip
+                        label="Gantt"
+                        icon={<Timeline sx={{ fontSize: 16 }} />}
+                        onClick={() => setShowGantt(!showGantt)}
+                        variant={showGantt ? 'filled' : 'outlined'}
+                        size="small"
+                        sx={{
+                            bgcolor: showGantt ? '#FF6B00' : 'transparent',
+                            color: showGantt ? 'white' : 'text.primary',
+                            borderColor: showGantt ? '#FF6B00' : 'divider',
+                            '&:hover': { bgcolor: showGantt ? '#E65100' : 'action.hover' },
+                            '& .MuiChip-icon': { color: showGantt ? 'white' : 'text.secondary' }
+                        }}
                     />
-                    <Button startIcon={<Add />} onClick={() => setOpenStageDialog(true)} size="small">Этап</Button>
-                    <Button startIcon={<Add />} onClick={() => setOpenRoleDialog(true)} size="small">Роль</Button>
+
+                    <Divider orientation="vertical" flexItem sx={{ mx: 0.5 }} />
+
+                    {/* Filled Tonal Buttons */}
+                    <Button
+                        startIcon={<Add />}
+                        onClick={() => setOpenStageDialog(true)}
+                        size="small"
+                        sx={{
+                            bgcolor: '#FFDCC2',
+                            color: '#331200',
+                            fontWeight: 500,
+                            '&:hover': { bgcolor: '#FFCC99' },
+                            textTransform: 'none',
+                        }}
+                    >
+                        Этап
+                    </Button>
+                    <Button
+                        startIcon={<Add />}
+                        onClick={() => setOpenRoleDialog(true)}
+                        size="small"
+                        sx={{
+                            bgcolor: '#FFDCC2',
+                            color: '#331200',
+                            fontWeight: 500,
+                            '&:hover': { bgcolor: '#FFCC99' },
+                            textTransform: 'none',
+                        }}
+                    >
+                        Роль
+                    </Button>
                 </Box>
             </Box>
 
-            {/* Gantt view - Material 3 style */}
+            {/* Gantt view - Material 3 Timeline style */}
             <Collapse in={showGantt}>
                 <Paper
                     elevation={0}
@@ -206,56 +304,141 @@ export default function BudgetMatrix({
                         p: 3,
                         mb: 3,
                         bgcolor: 'background.paper',
-                        borderRadius: 4,
+                        borderRadius: 6, // 24px Material 3
                         border: '1px solid',
                         borderColor: 'divider',
                         boxShadow: '0 1px 3px rgba(0,0,0,0.08)',
                     }}
                 >
                     <Box display="flex" alignItems="center" gap={1} mb={3}>
-                        <Timeline sx={{ color: 'primary.main' }} />
+                        <Timeline sx={{ color: '#FF6B00' }} />
                         <Typography variant="subtitle1" fontWeight={600}>
-                            Визуализация этапов
+                            Диаграмма Ганта (Недели)
+                        </Typography>
+                        <Typography variant="caption" color="text.secondary" sx={{ ml: 'auto' }}>
+                            Перетащите бары для изменения расписания
                         </Typography>
                     </Box>
-                    <ResponsiveContainer width="100%" height={Math.max(200, stages.length * 45)}>
-                        <BarChart data={ganttData} layout="vertical" margin={{ left: 10, right: 30, top: 10, bottom: 10 }}>
-                            <XAxis
-                                type="number"
-                                unit=" ч"
-                                tick={{ fontSize: 12, fill: '#666' }}
-                                axisLine={{ stroke: '#E0E0E0' }}
-                                tickLine={{ stroke: '#E0E0E0' }}
-                            />
-                            <YAxis
-                                type="category"
-                                dataKey="name"
-                                width={120}
-                                tick={{ fontSize: 13, fill: '#333' }}
-                                axisLine={false}
-                                tickLine={false}
-                            />
-                            <RechartsTooltip
-                                formatter={(value) => [`${value} ч`, 'Часы']}
-                                labelFormatter={(label) => `${label}`}
-                                contentStyle={{
-                                    borderRadius: 12,
-                                    border: 'none',
-                                    boxShadow: '0 4px 12px rgba(0,0,0,0.15)',
-                                    padding: '10px 14px',
+
+                    {/* Gantt Timeline */}
+                    <Box sx={{ overflowX: 'auto', pb: 2 }}>
+                        {/* Шкала недель */}
+                        <Box display="flex" mb={1} ml="200px" borderBottom="1px solid #E0E0E0">
+                            {Array.from({ length: maxWeeks + 1 }, (_, i) => (
+                                <Box
+                                    key={i}
+                                    sx={{
+                                        width: 50,
+                                        flexShrink: 0,
+                                        textAlign: 'center',
+                                        borderLeft: i === 0 ? 'none' : '1px solid #E0E0E0',
+                                        pb: 0.5,
+                                    }}
+                                >
+                                    <Typography variant="caption" color="text.secondary" fontWeight={500}>
+                                        {i + 1}
+                                    </Typography>
+                                </Box>
+                            ))}
+                            <Typography variant="caption" color="text.secondary" sx={{ ml: 1, alignSelf: 'center' }}>
+                                нед.
+                            </Typography>
+                        </Box>
+
+                        {/* Бары этапов */}
+                        {ganttData.map((item, idx) => (
+                            <Box
+                                key={item.name}
+                                display="flex"
+                                alignItems="center"
+                                mb={0.5}
+                                onMouseEnter={() => setHoveredStage(item.name)}
+                                onMouseLeave={() => setHoveredStage(null)}
+                                sx={{
+                                    minHeight: 44,
+                                    borderRadius: 2,
+                                    bgcolor: hoveredStage === item.name ? 'rgba(255, 107, 0, 0.04)' : 'transparent',
+                                    transition: 'background-color 0.2s',
                                 }}
-                            />
-                            <Bar dataKey="hours" radius={[0, 8, 8, 0]} barSize={28}>
-                                {ganttData.map((entry, idx) => (
-                                    <Cell
-                                        key={idx}
-                                        fill={entry.fill}
-                                        fillOpacity={entry.risk > 1 ? 0.85 : 1}
-                                    />
-                                ))}
-                            </Bar>
-                        </BarChart>
-                    </ResponsiveContainer>
+                            >
+                                {/* Название этапа (фиксированная ширина) */}
+                                <Box sx={{
+                                    width: 200,
+                                    flexShrink: 0,
+                                    pr: 2,
+                                }}>
+                                    <Tooltip title={item.name} placement="top-start">
+                                        <Typography
+                                            variant="body2"
+                                            noWrap
+                                            fontWeight={hoveredStage === item.name ? 600 : 500}
+                                            sx={{
+                                                color: hoveredStage === item.name ? '#FF6B00' : 'text.primary',
+                                                cursor: 'default',
+                                            }}
+                                        >
+                                            {item.name}
+                                        </Typography>
+                                    </Tooltip>
+                                    <Typography variant="caption" color="text.secondary">
+                                        {item.hours}ч · {item.duration} нед.
+                                    </Typography>
+                                </Box>
+
+                                {/* Бар (с drag) */}
+                                <Box
+                                    sx={{
+                                        ml: `${item.startOffset * 50}px`,
+                                        width: `${Math.max(item.duration * 50 - 4, 20)}px`,
+                                        height: 28,
+                                        bgcolor: hoveredStage === item.name ? '#FF6B00' : item.fill,
+                                        borderRadius: '4px 8px 8px 4px',
+                                        cursor: 'grab',
+                                        transition: 'background-color 0.2s, transform 0.1s, box-shadow 0.2s',
+                                        display: 'flex',
+                                        alignItems: 'center',
+                                        justifyContent: 'center',
+                                        boxShadow: hoveredStage === item.name ? '0 2px 8px rgba(255, 107, 0, 0.3)' : 'none',
+                                        '&:hover': {
+                                            transform: 'scaleY(1.08)'
+                                        },
+                                        '&:active': { cursor: 'grabbing' }
+                                    }}
+                                    draggable
+                                    onDragStart={(e) => {
+                                        e.dataTransfer.setData('stageName', item.name);
+                                        e.dataTransfer.setData('startOffset', String(item.startOffset));
+                                        e.dataTransfer.effectAllowed = 'move';
+                                    }}
+                                    onDragEnd={(e) => {
+                                        // Рассчитываем новое смещение на основе позиции
+                                        const dropX = e.clientX;
+                                        const container = e.target.closest('.MuiBox-root')?.parentElement;
+                                        if (container) {
+                                            const rect = container.getBoundingClientRect();
+                                            const relativeX = dropX - rect.left - 200; // 200px = ширина лейблов
+                                            const newOffset = Math.round(relativeX / 50);
+                                            handleStageOffsetChange(item.name, newOffset);
+                                        }
+                                    }}
+                                >
+                                    {item.duration > 1 && (
+                                        <Typography
+                                            variant="caption"
+                                            sx={{
+                                                color: 'white',
+                                                fontWeight: 600,
+                                                fontSize: '0.65rem',
+                                                textShadow: '0 1px 2px rgba(0,0,0,0.3)'
+                                            }}
+                                        >
+                                            {item.duration}н
+                                        </Typography>
+                                    )}
+                                </Box>
+                            </Box>
+                        ))}
+                    </Box>
                 </Paper>
             </Collapse>
 
@@ -451,7 +634,7 @@ export default function BudgetMatrix({
                             flex: 1,
                             minWidth: 320,
                             bgcolor: 'background.paper',
-                            borderRadius: 4,
+                            borderRadius: 6, // 24px Material 3
                             border: '1px solid',
                             borderColor: 'divider',
                             boxShadow: '0 1px 3px rgba(0,0,0,0.08)',
@@ -471,8 +654,8 @@ export default function BudgetMatrix({
                                             nameKey="name"
                                             cx="50%"
                                             cy="50%"
-                                            innerRadius={45}
-                                            outerRadius={70}
+                                            innerRadius={55}
+                                            outerRadius={75}
                                             paddingAngle={2}
                                         >
                                             {pieData.map((entry, idx) => (
@@ -528,18 +711,9 @@ export default function BudgetMatrix({
                                             <Typography variant="caption" color="text.secondary">
                                                 ч
                                             </Typography>
-                                            <Chip
-                                                label={`${Math.round((item.value / calculations.totalHours) * 100)}%`}
-                                                size="small"
-                                                sx={{
-                                                    ml: 1,
-                                                    height: 20,
-                                                    fontSize: '0.65rem',
-                                                    bgcolor: `${item.color}20`,
-                                                    color: item.color,
-                                                    fontWeight: 600,
-                                                }}
-                                            />
+                                            <Typography variant="caption" color="text.secondary" sx={{ ml: 1 }}>
+                                                {Math.round((item.value / calculations.totalHours) * 100)}%
+                                            </Typography>
                                         </Box>
                                     </Box>
                                 ))}
@@ -555,7 +729,7 @@ export default function BudgetMatrix({
                             flex: 1,
                             minWidth: 280,
                             background: 'linear-gradient(135deg, #FFF8F0 0%, #FFF0E0 100%)',
-                            borderRadius: 4,
+                            borderRadius: 6, // 24px Material 3
                             border: '1px solid',
                             borderColor: 'rgba(255, 152, 0, 0.2)',
                             boxShadow: '0 2px 8px rgba(255, 152, 0, 0.1)',
@@ -614,22 +788,30 @@ export default function BudgetMatrix({
 
                         <Divider sx={{ borderStyle: 'dashed', borderColor: 'rgba(0,0,0,0.1)' }} />
 
-                        <Box
-                            display="flex"
-                            justifyContent="space-between"
-                            alignItems="center"
-                            mt={2}
-                            sx={{
-                                p: 2,
-                                bgcolor: 'primary.main',
-                                borderRadius: 3,
-                                color: 'white',
-                            }}
-                        >
-                            <Typography variant="subtitle1" fontWeight={600}>
-                                ИТОГО:
+                        {/* Typography-based ИТОГО - Material 3 style */}
+                        <Box mt={2} textAlign="center">
+                            <Typography
+                                variant="caption"
+                                color="text.secondary"
+                                sx={{
+                                    textTransform: 'uppercase',
+                                    letterSpacing: '0.1em',
+                                    fontSize: '0.7rem',
+                                    display: 'block',
+                                    mb: 0.5,
+                                }}
+                            >
+                                Итого
                             </Typography>
-                            <Typography variant="h5" fontWeight={700}>
+                            <Typography
+                                variant="h4"
+                                fontWeight={700}
+                                sx={{
+                                    color: '#FF6B00',
+                                    letterSpacing: '-0.02em',
+                                    lineHeight: 1.2,
+                                }}
+                            >
                                 {calculations.totalWithRisk.toLocaleString('ru-RU')} ₽
                             </Typography>
                         </Box>

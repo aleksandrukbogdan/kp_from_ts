@@ -1,3 +1,35 @@
+/* Material 3 Design Tokens */
+:root {
+  /* Primary - Orange */
+  --md-sys-color-primary: #FF6B00;
+  --md-sys-color-primary-container: #FFDCC2;
+  --md-sys-color-on-primary-container: #331200;
+
+  /* Surface tones */
+  --md-sys-color-surface: #FFFBFF;
+  --md-sys-color-surface-1: #FEF7F4;
+  --md-sys-color-surface-2: #FDF3ED;
+  --md-sys-color-surface-variant: #F5DED4;
+
+  /* Chart palette (harmonized with orange) */
+  --chart-color-1: #FF6B00;
+  /* Primary orange */
+  --chart-color-2: #455A64;
+  /* Slate */
+  --chart-color-3: #00796B;
+  /* Teal */
+  --chart-color-4: #5D4037;
+  /* Brown */
+  --chart-color-5: #607D8B;
+  /* Blue-grey */
+  --chart-color-6: #BF360C;
+  /* Deep Orange */
+  --chart-color-7: #37474F;
+  /* Dark Slate */
+  --chart-color-8: #004D40;
+  /* Dark Teal */
+}
+
 /* Onest Font */
 @font-face {
   font-family: 'Onest';

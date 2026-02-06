@@ -12,3 +12,6 @@ markdown
 beautifulsoup4
 
 sqlalchemy>=2.0
+
+# Monitoring
+prometheus-fastapi-instrumentator==7.0.0
