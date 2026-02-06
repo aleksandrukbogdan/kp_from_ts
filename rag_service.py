@@ -28,15 +28,33 @@ def get_embedding_model():
     global _EMBEDDING_MODEL
     if _EMBEDDING_MODEL is None and HAS_RAG_DEPS:
         logger.info("Loading BGE-M3 model...")
-        # BAAI/bge-m3 is robust but large. 
-        # Fallback to smaller if needed? The user suggested BGE-M3 explicitly.
-        # "kviklet/bge-m3" or "BAAI/bge-m3"
         try:
-             _EMBEDDING_MODEL = SentenceTransformer("BAAI/bge-m3")
-             # Optimization: Compile if possible?
+            import torch
+            # Determine device - use CUDA if available, otherwise CPU
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            logger.info(f"Using device: {device}")
+            
+            # Load model with explicit device to avoid meta tensor issues
+            # CVE-2025-32434: Enforce safetensors to avoid torch.load vulnerability check
+            _EMBEDDING_MODEL = SentenceTransformer(
+                "BAAI/bge-m3",
+                device=device,
+                model_kwargs={"use_safetensors": True}
+            )
+            logger.info("BGE-M3 model loaded successfully.")
         except Exception as e:
             logger.error(f"Failed to load BGE-M3: {e}")
-            raise
+            # Fallback to smaller model if BGE-M3 fails
+            logger.info("Trying fallback to multilingual-e5-base...")
+            try:
+                _EMBEDDING_MODEL = SentenceTransformer(
+                    "intfloat/multilingual-e5-base",
+                    device="cpu"
+                )
+                logger.info("Fallback model loaded successfully.")
+            except Exception as e2:
+                logger.error(f"Fallback also failed: {e2}")
+                raise e
     return _EMBEDDING_MODEL
 
 class RAGService:

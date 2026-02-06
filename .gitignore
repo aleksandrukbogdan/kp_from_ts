@@ -171,3 +171,8 @@ lancedb_data
 shared_data
 
 *.exe
+
+reference_data.json
+reference_data.json.bak
+
+data

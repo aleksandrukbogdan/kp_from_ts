@@ -1,4 +1,16 @@
-FROM python:3.10-slim
+# NVIDIA PyTorch image with CUDA support for H100
+# Using 2.3.1 because docling requires torch >= 2.2.2
+FROM pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime
+
+# Install system dependencies for Docling, OCR, and DOCX conversion
+RUN apt-get update && apt-get install -y \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    tesseract-ocr \
+    poppler-utils \
+    libreoffice-writer \
+    && rm -rf /var/lib/apt/lists/*
+
 
 WORKDIR /app
 

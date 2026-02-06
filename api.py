@@ -3,7 +3,7 @@ import asyncio
 import os
 import json
 from typing import List, Dict, Any
-from fastapi import FastAPI, UploadFile, File, HTTPException, Cookie, Depends, Request
+from fastapi import FastAPI, UploadFile, File, HTTPException, Cookie, Depends, Request, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from temporalio.client import Client
@@ -11,6 +11,13 @@ from temporalio.client import Client
 # Импорт твоих workflow
 from workflows import ProposalWorkflow
 from users import validate_user
+from database import (
+    save_user_file, 
+    update_file_status,
+    get_user_files,
+    get_file_by_workflow_id,
+    get_file_owner
+)
 from fastapi.responses import StreamingResponse
 from utils_docx import markdown_to_docx
 import shutil
@@ -84,6 +91,7 @@ async def login(request: LoginRequest):
 @app.post("/api/start")
 async def start_workflow(
     file: UploadFile = File(...),
+    convert_to_pdf_for_pages: bool = Form(default=True),  # Convert DOCX→PDF for page numbers
     user: str = Depends(verify_auth)
 ):
     client = await get_temporal_client()
@@ -105,16 +113,102 @@ async def start_workflow(
     try:
         handle = await client.start_workflow(
             ProposalWorkflow.run,
-            args=[file_path, file.filename], # Pass PATH, not content
+            args=[file_path, file.filename, convert_to_pdf_for_pages],  # Pass conversion flag
             id=wf_id,
             task_queue="proposal-queue", # Важно: совпадает с worker.py
         )
+        
+        # Save to user history database
+        save_user_file(
+            username=user,
+            workflow_id=handle.id,
+            original_filename=file.filename
+        )
+        
         return {"workflow_id": handle.id}
     except Exception as e:
         # Если workflow уже запущен, возвращаем его ID
         if "Workflow execution already started" in str(e):
              return {"workflow_id": wf_id}
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/history")
+async def get_history(user: str = Depends(verify_auth)):
+    """Get file upload history for the current user with live status sync."""
+    from datetime import timedelta
+    
+    files = get_user_files(user)
+    client = await get_temporal_client()
+    
+    # For non-completed workflows, try to sync status from Temporal
+    for f in files:
+        if f.get('status') not in ('COMPLETED', None):
+            try:
+                handle = client.get_workflow_handle(f['workflow_id'])
+                state = await handle.query(ProposalWorkflow.get_data, rpc_timeout=timedelta(seconds=2))
+                new_status = state.get('status', 'PROCESSING')
+                
+                # Update cache if status changed
+                if new_status != f.get('status'):
+                    state_to_cache = {k: v for k, v in state.items() if k != 'final_proposal'}
+                    update_file_status(
+                        workflow_id=f['workflow_id'],
+                        status=new_status,
+                        extracted_data=state_to_cache,
+                        final_proposal=state.get('final_proposal')
+                    )
+                    f['status'] = new_status
+            except Exception as e:
+                # On error, keep existing status (workflow might be completed or not found)
+                error_msg = str(e).lower()
+                if 'workflow execution already completed' in error_msg:
+                    # Mark as completed in DB
+                    update_file_status(workflow_id=f['workflow_id'], status='COMPLETED')
+                    f['status'] = 'COMPLETED'
+    
+    return {"files": files}
+
+
+@app.get("/api/file/{workflow_id}")
+async def get_file_details(workflow_id: str, user: str = Depends(verify_auth)):
+    """Get details of a specific file by workflow_id, syncing from Temporal if cache empty."""
+    from datetime import timedelta
+    
+    file_data = get_file_by_workflow_id(workflow_id)
+    
+    if not file_data:
+        raise HTTPException(status_code=404, detail="File not found")
+    
+    # Security: only owner can access
+    if file_data.get("username") != user:
+        raise HTTPException(status_code=403, detail="Access denied")
+    
+    # If cache is empty, try to fetch from Temporal
+    if not file_data.get('extracted_data') or not file_data.get('final_proposal'):
+        try:
+            client = await get_temporal_client()
+            handle = client.get_workflow_handle(workflow_id)
+            state = await handle.query(ProposalWorkflow.get_data, rpc_timeout=timedelta(seconds=5))
+            
+            # Update cache with fresh data
+            state_to_cache = {k: v for k, v in state.items() if k != 'final_proposal'}
+            update_file_status(
+                workflow_id=workflow_id,
+                status=state.get('status', file_data.get('status')),
+                extracted_data=state_to_cache,
+                final_proposal=state.get('final_proposal')
+            )
+            
+            # Update response with fresh data
+            file_data['extracted_data'] = state_to_cache
+            file_data['final_proposal'] = state.get('final_proposal')
+            file_data['status'] = state.get('status')
+        except Exception as e:
+            print(f"Failed to sync from Temporal for {workflow_id}: {e}")
+            # Continue with cached data (might be partial)
+    
+    return file_data
+
 
 @app.get("/api/status/{workflow_id}")
 async def get_status(workflow_id: str, user: str = Depends(verify_auth)):
@@ -126,6 +220,17 @@ async def get_status(workflow_id: str, user: str = Depends(verify_auth)):
     try:
         # Query с коротким timeout - если worker занят, вернём статус "обработка"
         state = await handle.query(ProposalWorkflow.get_data, rpc_timeout=timedelta(seconds=10))
+        
+        # Sync status to database for history tracking
+        # Cache the full state (excluding final_proposal which is cached separately)
+        state_to_cache = {k: v for k, v in state.items() if k != 'final_proposal'}
+        update_file_status(
+            workflow_id=workflow_id,
+            status=state.get("status", "PROCESSING"),
+            extracted_data=state_to_cache,  # Full state for analysis restoration
+            final_proposal=state.get("final_proposal")
+        )
+        
         return state
     except Exception as e:
         error_msg = str(e).lower()
@@ -171,8 +276,18 @@ async def approve_workflow(
         "rates": payload.rates
     }
     
-    await handle.signal(ProposalWorkflow.user_approve_signal, signal_data)
-    return {"status": "Signal sent"}
+    try:
+        await handle.signal(ProposalWorkflow.user_approve_signal, signal_data)
+        return {"status": "Signal sent"}
+    except Exception as e:
+        error_msg = str(e).lower()
+        # If workflow is already completed, it cannot accept signals
+        if "workflow execution already completed" in error_msg or "not found" in error_msg:
+            raise HTTPException(
+                status_code=409,  # Conflict
+                detail="Этот документ уже завершён и не может быть повторно обработан. Загрузите файл заново для создания нового КП."
+            )
+        raise HTTPException(status_code=500, detail=f"Failed to send signal: {e}")
 
 @app.post("/api/download_docx")
 async def download_docx(request: DownloadRequest, user: str = Depends(verify_auth)):

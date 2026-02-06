@@ -1,7 +1,12 @@
-
 # Heavy dependencies (Cached Layer)
-torch
-sentence-transformers
+--extra-index-url https://download.pytorch.org/whl/cu121
+
+# docling will install compatible torch/torchvision versions
+# transformers >= 4.36.0 required for AutoProcessor
+docling
+transformers>=4.36.0
+sentence-transformers>=2.2.0
 numpy
 pandas
 lancedb
+pdf2image

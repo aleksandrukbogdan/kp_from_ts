@@ -9,10 +9,10 @@ import {
 } from '@mui/material';
 import {
   CloudUpload, CheckCircle, Add, Delete, Refresh, ArrowBack, Logout, Person, GetApp,
-  Warning, Error as ErrorIcon, SyncProblem
+  Warning, Error as ErrorIcon, SyncProblem, Edit, PlayArrow, Visibility, Description, Schedule
 } from '@mui/icons-material';
 import axios from 'axios';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import { config } from './config';
 import MarkdownEditor from './MarkdownEditor';
 import BudgetMatrix from './BudgetMatrix';
@@ -47,6 +47,15 @@ export default function AgentKP() {
   const [username, setUsername] = useState('');
   const [anchorEl, setAnchorEl] = useState(null);
 
+
+
+  // State for toggling text fields visibility
+  const [editMode, setEditMode] = useState({
+    tech_stack: false,
+    business_goals: false,
+    key_features: false
+  });
+
   // --- Состояние Сметы ---
   const [roles, setRoles] = useState({ "Менеджер": 2500, "ML-Инженер": 3500, "Frontend": 3000 });
   const [stages, setStages] = useState(["Сбор данных", "Прототип", "Разработка", "Тестирование"]);
@@ -61,12 +70,21 @@ export default function AgentKP() {
 
   // --- Новые состояния для фич ---
   const [requirementIssues, setRequirementIssues] = useState([]);
-  const [detailedRequirements, setDetailedRequirements] = useState([]); // RAG Analysis
   const [sourceExcerpts, setSourceExcerpts] = useState({});
   const [rawText, setRawText] = useState('');
   const [suggestedHours, setSuggestedHours] = useState({});
   const [selectedItem, setSelectedItem] = useState(null);  // {field, text, source} - выбранный пункт
   const [userModified, setUserModified] = useState({});  // {этап: {роль: true/false}}
+
+  // --- История файлов ---
+  const [historyFiles, setHistoryFiles] = useState([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+
+  // --- Флаг локального редактирования (блокирует polling) ---
+  const [isLocalEditing, setIsLocalEditing] = useState(false);
+
+  // --- Сохранённое КП для возврата ---
+  const [cachedFinalDoc, setCachedFinalDoc] = useState(null);
 
   // Хелпер: найти issue для пункта (Нечеткое сравнение)
   const getIssueForItem = (fieldName, itemText) => {
@@ -99,6 +117,260 @@ export default function AgentKP() {
     }
   }, [navigate]);
 
+  // Check for workflow_id in URL params (for resuming sessions)
+  const [searchParams] = useSearchParams();
+
+  useEffect(() => {
+    const resumeWorkflowId = searchParams.get('workflow_id');
+    if (resumeWorkflowId && !workflowId) {
+      // Resume existing workflow from history
+      setWorkflowId(resumeWorkflowId);
+      setStatus('PROCESSING'); // Start polling
+    }
+  }, [searchParams, workflowId]);
+
+  // Fetch user's file history
+  const fetchHistory = async (silent = false) => {
+    if (!silent) setHistoryLoading(true);
+    try {
+      const res = await axios.get(`${API_URL}/history`);
+      setHistoryFiles(res.data.files || []);
+    } catch (err) {
+      console.error('Failed to load history:', err);
+    } finally {
+      if (!silent) setHistoryLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!workflowId) {
+      fetchHistory(); // Initial load with loading indicator
+      // Auto-refresh history every 10 seconds (silent, no loading indicator)
+      const historyInterval = setInterval(() => {
+        fetchHistory(true); // Silent refresh
+      }, 10000);
+      return () => clearInterval(historyInterval);
+    }
+  }, [workflowId]);
+
+  const formatDate = (isoString) => {
+    if (!isoString) return '—';
+    const date = new Date(isoString);
+    return date.toLocaleDateString('ru-RU', {
+      day: '2-digit',
+      month: '2-digit',
+      year: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit'
+    });
+  };
+
+  const getStatusChip = (status) => {
+    const statusConfig = {
+      'PROCESSING': { label: 'Обработка', color: 'warning' },
+      'WAITING_FOR_HUMAN': { label: 'Ожидает проверки', color: 'info' },
+      'GENERATING': { label: 'Генерация КП', color: 'primary' },
+      'COMPLETED': { label: 'Завершено', color: 'success' },
+      'ERROR': { label: 'Ошибка', color: 'error' }
+    };
+    const cfg = statusConfig[status] || { label: status, color: 'default' };
+    return <Chip label={cfg.label} color={cfg.color} size="small" />;
+  };
+
+  const handleResumeWorkflow = async (wfId, cachedStatus) => {
+    // Reset all state for clean resume
+    setData(null);
+    setFinalDoc(null);
+    setFile(null);
+    setIsLocalEditing(false); // Reset editing mode
+    setWorkflowId(wfId);
+
+    // For COMPLETED workflows, we need to load cached data from API
+    if (cachedStatus === 'COMPLETED') {
+      try {
+        const res = await axios.get(`${API_URL}/file/${wfId}`);
+        const fileData = res.data;
+        console.log('Loaded cached data:', fileData); // Debug
+
+        if (fileData.final_proposal) {
+          setFinalDoc(fileData.final_proposal);
+        }
+
+        // fileData.extracted_data now contains the full cached state (with suggested_hours, stages, etc)
+        let dataLoaded = false;
+        if (fileData.extracted_data) {
+          const cachedState = fileData.extracted_data;
+          // extracted_data within the cached state contains the actual data
+          if (cachedState.extracted_data) {
+            processExtractedData(cachedState.extracted_data, cachedState);
+            dataLoaded = true;
+          } else if (cachedState.client_name || cachedState.project_essence) {
+            // Old format: extracted_data IS the data directly
+            processExtractedData(cachedState, cachedState);
+            dataLoaded = true;
+          }
+        }
+
+        if (fileData.final_proposal) {
+          setStatus('COMPLETED');
+        } else if (!dataLoaded) {
+          // No cached data available, try polling (workflow might still be queryable)
+          console.log('No cached data, trying polling...');
+          setStatus('PROCESSING');
+        } else {
+          setStatus('COMPLETED');
+        }
+      } catch (err) {
+        console.error('Failed to load cached data:', err);
+        setStatus('PROCESSING'); // Fallback to polling
+      }
+    } else {
+      // For non-completed, start polling
+      setStatus('PROCESSING');
+    }
+  };
+
+  // Helper to process extracted data (used by both polling and resume)
+  const processExtractedData = (raw, state) => {
+    // Helper functions defined inline
+    const safelyExtractText = (val) => {
+      if (!val) return '';
+      if (typeof val === 'string') return val;
+      if (typeof val === 'object') return val.text || '';
+      return String(val);
+    };
+
+    const extractTextArray = (val) => {
+      if (!val) return [];
+      if (Array.isArray(val)) {
+        return val.map(item => typeof item === 'object' ? (item.text || '') : item);
+      }
+      if (typeof val === 'string') return [val];
+      return [];
+    };
+
+    const normalizeToObjects = (val) => {
+      if (!val) return [];
+      let arr = [];
+      if (Array.isArray(val)) arr = val;
+      else if (typeof val === 'string') arr = [val];
+
+      return arr.map(item => {
+        if (typeof item === 'string') return { text: item, source: '' };
+        if (typeof item === 'object') return {
+          text: item.text || '',
+          source: item.source_quote || item.source || '',
+          page_number: item.page_number || null,
+          rag_confidence: item.rag_confidence || null
+        };
+        return { text: '', source: '' };
+      });
+    };
+
+    const extractCategorizedFeatures = (obj) => {
+      if (!obj || typeof obj !== 'object') return '';
+      if (Array.isArray(obj)) {
+        return extractTextArray(obj).join('\n');
+      }
+      const allTexts = [];
+      Object.values(obj).forEach(categoryArr => {
+        if (Array.isArray(categoryArr)) {
+          categoryArr.forEach(item => {
+            allTexts.push(typeof item === 'object' ? (item.text || '') : item);
+          });
+        }
+      });
+      return allTexts.join('\n');
+    };
+
+    const flattenCategorizedFeatures = (obj) => {
+      if (!obj || typeof obj !== 'object') return [];
+      if (Array.isArray(obj)) return normalizeToObjects(obj);
+      const allItems = [];
+      Object.entries(obj).forEach(([category, items]) => {
+        if (Array.isArray(items)) {
+          items.forEach(item => {
+            const normalized = typeof item === 'string' ? { text: item, source: '' } : (item || { text: '', source: '' });
+            allItems.push({ ...normalized, category });
+          });
+        }
+      });
+      return allItems;
+    };
+
+    const formattedData = {
+      ...raw,
+      client_name: safelyExtractText(raw.client_name),
+      project_essence: safelyExtractText(raw.project_essence),
+      project_type: safelyExtractText(raw.project_type),
+      business_goals: extractTextArray(raw.business_goals).join('\n'),
+      key_features: extractCategorizedFeatures(raw.key_features),
+      tech_stack: extractTextArray(raw.tech_stack).join('\n'),
+      client_integrations: extractTextArray(raw.client_integrations).join('\n'),
+      _original: {
+        ...raw,
+        client_name: raw.client_name,
+        project_essence: raw.project_essence,
+        project_type: raw.project_type,
+        tech_stack: normalizeToObjects(raw.tech_stack),
+        business_goals: normalizeToObjects(raw.business_goals),
+        client_integrations: normalizeToObjects(raw.client_integrations),
+        key_features_flat: flattenCategorizedFeatures(raw.key_features)
+      }
+    };
+    setData(formattedData);
+
+    setRequirementIssues(raw.requirement_issues || []);
+    setRawText(state?.raw_text_preview || '');
+    setSuggestedHours(state?.suggested_hours || {});
+
+    const aiStages = state?.suggested_stages || raw.suggested_stages || ["Сбор данных", "Прототип", "Разработка", "Тестирование"];
+    const aiRoles = state?.suggested_roles || raw.suggested_roles || ["Менеджер", "Frontend", "Backend", "Дизайнер"];
+
+    setStages(aiStages);
+    const defaultRates = {
+      "Менеджер проекта": 2500, "Системный аналитик": 2800,
+      "Дизайнер UI/UX": 2800, "Frontend-разработчик": 3000,
+      "Backend-разработчик": 3000, "Fullstack-разработчик": 3200,
+      "ML-инженер": 3500, "DevOps-инженер": 3200, "QA-инженер": 2200,
+    };
+    const rolesWithRates = {};
+    aiRoles.forEach(r => { rolesWithRates[r] = defaultRates[r] || 2500; });
+    setRoles(rolesWithRates);
+
+    const initialMatrix = {};
+    const suggestedMatrix = state?.suggested_hours || {};
+    aiStages.forEach(s => {
+      initialMatrix[s] = {};
+      aiRoles.forEach(r => { initialMatrix[s][r] = suggestedMatrix[s]?.[r] || 0; });
+    });
+    setBudgetMatrix(initialMatrix);
+
+    const initialModified = {};
+    aiStages.forEach(s => {
+      initialModified[s] = {};
+      aiRoles.forEach(r => initialModified[s][r] = false);
+    });
+    setUserModified(initialModified);
+  };
+
+  // --- Return to Analysis for COMPLETED workflows ---
+  const handleReturnToAnalysis = () => {
+    setIsLocalEditing(true); // Prevent polling from overwriting status
+    setCachedFinalDoc(finalDoc); // Save the old KP for potential return
+    setFinalDoc(null);
+    setStatus('WAITING_FOR_HUMAN');
+  };
+
+  // --- Return to saved KP (when user doesn't want to regenerate) ---
+  const handleReturnToOldKP = () => {
+    if (cachedFinalDoc) {
+      setFinalDoc(cachedFinalDoc);
+      setStatus('COMPLETED');
+      setIsLocalEditing(false);
+    }
+  };
+
   const handleMenuOpen = (event) => {
     setAnchorEl(event.currentTarget);
   };
@@ -123,6 +395,7 @@ export default function AgentKP() {
       // Отправляем файл на FastAPI
       const res = await axios.post(`${API_URL}/start`, formData);
       setWorkflowId(res.data.workflow_id);
+      setIsLocalEditing(false); // Ensure polling is enabled
       setStatus("PROCESSING");
     } catch (err) {
       alert("Ошибка соединения с сервером: " + err.message);
@@ -131,7 +404,8 @@ export default function AgentKP() {
 
   // --- 2. ОПРОС СТАТУСА (Long Polling) ---
   useEffect(() => {
-    if (!workflowId || status === "COMPLETED") return;
+    // Don't poll if: no workflow, already completed, or in local editing mode
+    if (!workflowId || status === "COMPLETED" || isLocalEditing) return;
 
     const interval = setInterval(async () => {
       try {
@@ -152,9 +426,9 @@ export default function AgentKP() {
             return String(val);
           };
 
-          // Helper: Extract source from object if available
+          // Helper: Extract source from object if available (supports both source_quote from RAG and legacy source)
           const safelyExtractSource = (val) => {
-            if (val && typeof val === 'object') return val.source || '';
+            if (val && typeof val === 'object') return val.source_quote || val.source || '';
             return '';
           };
 
@@ -168,7 +442,7 @@ export default function AgentKP() {
             return [];
           };
 
-          // Helper: Normalize to objects for _original (UI expects {text, source})
+          // Helper: Normalize to objects for _original (UI expects {text, source, page_number})
           const normalizeToObjects = (val) => {
             if (!val) return [];
             let arr = [];
@@ -177,7 +451,12 @@ export default function AgentKP() {
 
             return arr.map(item => {
               if (typeof item === 'string') return { text: item, source: '' };
-              if (typeof item === 'object') return { text: item.text || '', source: item.source || '' };
+              if (typeof item === 'object') return {
+                text: item.text || '',
+                source: item.source_quote || item.source || '',
+                page_number: item.page_number || null,
+                rag_confidence: item.rag_confidence || null
+              };
               return { text: '', source: '' };
             });
           };
@@ -244,7 +523,6 @@ export default function AgentKP() {
 
           // Сохраняем новые данные
           setRequirementIssues(raw.requirement_issues || []);
-          setDetailedRequirements(state.requirements_analysis || []);
           // sourceExcerpts больше не нужны, берем из _original
           setRawText(state.raw_text_preview || '');
           setSuggestedHours(state.suggested_hours || {});
@@ -308,7 +586,7 @@ export default function AgentKP() {
     }, 2000); // Спрашиваем каждые 2 секунды
 
     return () => clearInterval(interval);
-  }, [workflowId, status, data]);
+  }, [workflowId, status, data, isLocalEditing]); // Added isLocalEditing to restart polling when needed
 
   // --- 3. ЛОГИКА ТАБЛИЦЫ ---
   const handleHourChange = (stage, role, value) => {
@@ -415,9 +693,21 @@ export default function AgentKP() {
         budget: budgetMatrix,
         rates: roles
       });
+      setCachedFinalDoc(null); // Clear cached doc since we're generating new
+      setIsLocalEditing(false); // Re-enable polling for generation status
       setStatus("GENERATING"); // Локально меняем статус, чтобы показать спиннер
     } catch (err) {
-      alert("Ошибка отправки: " + err.message);
+      if (err.response?.status === 409) {
+        // Workflow is already completed
+        const message = err.response?.data?.detail || "Этот документ уже завершён. Загрузите файл заново для создания нового КП.";
+        alert(message);
+        // If we have cached doc, offer to return
+        if (cachedFinalDoc) {
+          handleReturnToOldKP();
+        }
+      } else {
+        alert("Ошибка отправки: " + (err.response?.data?.detail || err.message));
+      }
     }
   };
 
@@ -514,50 +804,154 @@ export default function AgentKP() {
 
         {/* БЛОК 1: ЗАГРУЗКА */}
         {!workflowId && (
-          <Paper
-            elevation={0}
-            sx={{
-              p: 8,
-              textAlign: 'center',
-              border: '2px dashed',
-              borderColor: 'primary.main',
-              borderRadius: 4,
-              bgcolor: 'rgba(255, 107, 0, 0.02)',
-            }}
-          >
-            <CloudUpload sx={{ fontSize: 80, color: 'primary.main', mb: 3, opacity: 0.8 }} />
-            <Typography variant="h5" gutterBottom fontWeight={600}>
-              Загрузите Техническое Задание
-            </Typography>
-            <Typography color="text.secondary" paragraph sx={{ mb: 4 }}>
-              Поддерживаются форматы PDF, DOCX и TXT
-            </Typography>
+          <Box>
+            {/* Upload Section */}
+            <Paper
+              elevation={0}
+              sx={{
+                p: 6,
+                textAlign: 'center',
+                border: '2px dashed',
+                borderColor: 'primary.main',
+                borderRadius: 4,
+                bgcolor: 'rgba(255, 107, 0, 0.02)',
+                mb: 4
+              }}
+            >
+              <CloudUpload sx={{ fontSize: 64, color: 'primary.main', mb: 2, opacity: 0.8 }} />
+              <Typography variant="h5" gutterBottom fontWeight={600}>
+                Загрузите Техническое Задание
+              </Typography>
+              <Typography color="text.secondary" paragraph sx={{ mb: 3 }}>
+                Поддерживаются форматы PDF, DOCX и TXT
+              </Typography>
 
-            <input
-              accept=".pdf,.docx,.txt"
-              style={{ display: 'none' }}
-              id="upload-file"
-              type="file"
-              onChange={(e) => setFile(e.target.files[0])}
-            />
-            <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2 }}>
-              <label htmlFor="upload-file">
-                <Button variant="outlined" component="span" size="large" sx={{ px: 4 }}>
-                  {file ? file.name : "Выбрать файл"}
+              <input
+                accept=".pdf,.docx,.txt"
+                style={{ display: 'none' }}
+                id="upload-file"
+                type="file"
+                onChange={(e) => setFile(e.target.files[0])}
+              />
+              <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2 }}>
+                <label htmlFor="upload-file">
+                  <Button variant="outlined" component="span" size="large" sx={{ px: 4 }}>
+                    {file ? file.name : "Выбрать файл"}
+                  </Button>
+                </label>
+                <Button
+                  variant="contained"
+                  size="large"
+                  onClick={handleUpload}
+                  disabled={!file}
+                  startIcon={<CheckCircle />}
+                  sx={{ px: 5 }}
+                >
+                  Запустить анализ
                 </Button>
-              </label>
-              <Button
-                variant="contained"
-                size="large"
-                onClick={handleUpload}
-                disabled={!file}
-                startIcon={<CheckCircle />}
-                sx={{ px: 5 }}
-              >
-                Запустить анализ
-              </Button>
+              </Box>
+            </Paper>
+
+            {/* History Section */}
+            <Box sx={{ mb: 3, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <Typography variant="h6" fontWeight={600}>
+                История загрузок
+              </Typography>
+              <IconButton onClick={fetchHistory} disabled={historyLoading} size="small">
+                <Refresh />
+              </IconButton>
             </Box>
-          </Paper>
+
+            {historyLoading && (
+              <Box sx={{ display: 'flex', justifyContent: 'center', py: 4 }}>
+                <CircularProgress size={32} />
+              </Box>
+            )}
+
+            {!historyLoading && historyFiles.length === 0 && (
+              <Paper
+                elevation={0}
+                sx={{
+                  p: 4,
+                  textAlign: 'center',
+                  borderRadius: 3,
+                  bgcolor: 'grey.50'
+                }}
+              >
+                <Schedule sx={{ fontSize: 48, color: 'text.secondary', mb: 1, opacity: 0.5 }} />
+                <Typography variant="body2" color="text.secondary">
+                  Пока нет загруженных файлов
+                </Typography>
+              </Paper>
+            )}
+
+            {!historyLoading && historyFiles.length > 0 && (
+              <TableContainer component={Paper} elevation={0} sx={{ borderRadius: 3 }}>
+                <Table size="small">
+                  <TableHead>
+                    <TableRow>
+                      <TableCell>Файл</TableCell>
+                      <TableCell>Дата</TableCell>
+                      <TableCell>Статус</TableCell>
+                      <TableCell align="right"></TableCell>
+                    </TableRow>
+                  </TableHead>
+                  <TableBody>
+                    {historyFiles.map((f) => (
+                      <TableRow key={f.workflow_id} hover>
+                        <TableCell>
+                          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                            <Description sx={{ color: 'primary.main', fontSize: 20, opacity: 0.7 }} />
+                            <Typography variant="body2" sx={{ maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                              {f.filename}
+                            </Typography>
+                          </Box>
+                        </TableCell>
+                        <TableCell>
+                          <Typography variant="body2" color="text.secondary">
+                            {formatDate(f.uploaded_at)}
+                          </Typography>
+                        </TableCell>
+                        <TableCell>
+                          {getStatusChip(f.status)}
+                        </TableCell>
+                        <TableCell align="right">
+                          {f.status === 'COMPLETED' ? (
+                            <Button
+                              size="small"
+                              variant="outlined"
+                              startIcon={<Visibility />}
+                              onClick={() => handleResumeWorkflow(f.workflow_id, f.status)}
+                            >
+                              Просмотр
+                            </Button>
+                          ) : f.status === 'PROCESSING' || f.status === 'GENERATING' ? (
+                            <Button
+                              size="small"
+                              variant="contained"
+                              startIcon={<PlayArrow />}
+                              onClick={() => handleResumeWorkflow(f.workflow_id, f.status)}
+                            >
+                              Открыть
+                            </Button>
+                          ) : (
+                            <Button
+                              size="small"
+                              variant="contained"
+                              startIcon={<PlayArrow />}
+                              onClick={() => handleResumeWorkflow(f.workflow_id, f.status)}
+                            >
+                              Продолжить
+                            </Button>
+                          )}
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </TableContainer>
+            )}
+          </Box>
         )}
 
         {/* БЛОК 2: ЗАГРУЗКА / ОЖИДАНИЕ */}
@@ -579,12 +973,19 @@ export default function AgentKP() {
         {status === "WAITING_FOR_HUMAN" && data && (
           <Paper elevation={0} sx={{ p: 0, bgcolor: 'transparent' }}>
 
-            {/* Основной layout: контент + боковая панель */}
-            <Box display="flex" gap={3}>
+            {/* Основной layout: CSS Grid с двумя колонками */}
+            <Box
+              sx={{
+                display: 'grid',
+                gridTemplateColumns: { xs: '1fr', lg: '1fr 350px' },
+                gap: 3,
+                alignItems: 'start'
+              }}
+            >
 
               {/* Левая часть: основной контент */}
-              <Box flex={2}>
-                <Container maxWidth="md" disableGutters>
+              <Box sx={{ overflow: 'hidden', minWidth: 0 }}>
+                <Box sx={{ pr: 1 }}>
                   <Typography variant="h4" gutterBottom fontWeight={700} sx={{ mb: 3, letterSpacing: '-0.02em' }}>
                     Проверка данных
                   </Typography>
@@ -675,8 +1076,8 @@ export default function AgentKP() {
                     </Paper>
                   )}
 
-                  {/* BENTO GRID LAYOUT */}
-                  <Box display="grid" gridTemplateColumns={{ xs: '1fr', md: '1fr 1fr' }} gap={3} sx={{ mb: 4 }}>
+                  {/* BENTO GRID LAYOUT - улучшенная структура */}
+                  <Box display="grid" gridTemplateColumns={{ xs: '1fr', md: '200px 1fr' }} gap={2} sx={{ mb: 4 }}>
 
                     {/* 1. КЛИЕНТ */}
                     <Paper
@@ -719,50 +1120,86 @@ export default function AgentKP() {
                         border: '1px solid',
                         borderColor: !data.tech_stack ? '#FFCC80' : 'divider',
                         display: 'flex',
-                        flexDirection: 'column'
+                        flexDirection: 'column',
+                        minWidth: 0
                       }}
                     >
                       <Box display="flex" justifyContent="space-between" alignItems="center" mb={1}>
-                        <Typography variant="subtitle2" color="text.secondary" sx={{ pl: 0.5, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
-                          Стек технологий
-                        </Typography>
+                        <Box display="flex" alignItems="center" gap={1}>
+                          <Typography variant="subtitle2" color="text.secondary" sx={{ pl: 0.5, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                            Стек технологий
+                          </Typography>
+                          <IconButton
+                            size="small"
+                            onClick={() => setEditMode({ ...editMode, tech_stack: !editMode.tech_stack })}
+                            sx={{ color: editMode.tech_stack ? 'primary.main' : 'action.disabled', p: 0.5 }}
+                          >
+                            <Edit fontSize="small" />
+                          </IconButton>
+                        </Box>
                         {!data.tech_stack && (
                           <Chip label="Не указан" size="small" color="warning" variant="outlined" />
                         )}
                       </Box>
                       {/* Кликабельные чипы для стека */}
-                      {data._original?.tech_stack?.length > 0 && (
-                        <Box display="flex" flexWrap="wrap" gap={0.5} mb={1.5} sx={{ flex: 1, alignContent: 'flex-start' }}>
-                          {data._original.tech_stack.map((item, idx) => {
-                            const isSelected = selectedItem?.field === 'tech_stack' && selectedItem?.text === item.text;
-                            return (
-                              <Chip
-                                key={idx}
-                                label={item.text}
-                                size="small"
-                                onClick={() => setSelectedItem({ field: 'tech_stack', text: item.text, source: item.source })}
-                                variant={isSelected ? 'filled' : 'outlined'}
-                                color={isSelected ? 'primary' : 'default'}
-                                sx={{ cursor: 'pointer' }}
-                              />
-                            );
-                          })}
-                        </Box>
-                      )}
-                      <TextField
-                        fullWidth
-                        hiddenLabel
-                        variant="filled"
-                        size="small"
-                        multiline
-                        minRows={3}
-                        value={data.tech_stack || ''}
-                        onChange={(e) => setData({ ...data, tech_stack: e.target.value })}
-                        placeholder="Добавить технологии..."
-                        helperText={!data.tech_stack ? "Если не указано в ТЗ, добавьте вручную" : ""}
-                        InputProps={{ disableUnderline: true, sx: { borderRadius: 1.5, bgcolor: !data.tech_stack ? 'white' : 'grey.50', fontSize: '0.85rem', alignItems: 'flex-start' } }}
-                        FormHelperTextProps={{ sx: { ml: 0, mt: 1, color: 'text.secondary' } }}
-                      />
+                      {(() => {
+                        // Get chips from _original or fallback to parsing text
+                        const techStackItems = data._original?.tech_stack?.length > 0
+                          ? data._original.tech_stack
+                          : (data.tech_stack ? data.tech_stack.split('\n').filter(t => t.trim()).map(t => ({ text: t.trim(), source: '' })) : []);
+
+                        if (techStackItems.length === 0) return null;
+
+                        return (
+                          <Box display="flex" flexWrap="wrap" gap={0.5} mb={1.5} sx={{ flex: 1, alignContent: 'flex-start' }}>
+                            {techStackItems.map((item, idx) => {
+                              const isSelected = selectedItem?.field === 'tech_stack' && selectedItem?.text === item.text;
+                              return (
+                                <Chip
+                                  key={idx}
+                                  label={item.text}
+                                  size="small"
+                                  onClick={() => setSelectedItem({
+                                    field: 'tech_stack',
+                                    text: item.text,
+                                    source: item.source,
+                                    page_number: item.page_number,
+                                    rag_confidence: item.rag_confidence
+                                  })}
+                                  variant={isSelected ? 'filled' : 'outlined'}
+                                  color={isSelected ? 'primary' : 'default'}
+                                  sx={{
+                                    cursor: 'pointer',
+                                    height: 'auto',
+                                    '& .MuiChip-label': {
+                                      display: 'block',
+                                      whiteSpace: 'normal',
+                                      overflow: 'visible'
+                                    },
+                                    py: 0.5
+                                  }}
+                                />
+                              );
+                            })}
+                          </Box>
+                        );
+                      })()}
+                      <Collapse in={editMode.tech_stack}>
+                        <TextField
+                          fullWidth
+                          hiddenLabel
+                          variant="filled"
+                          size="small"
+                          multiline
+                          minRows={3}
+                          value={data.tech_stack || ''}
+                          onChange={(e) => setData({ ...data, tech_stack: e.target.value })}
+                          placeholder="Добавить технологии..."
+                          helperText={!data.tech_stack ? "Если не указано в ТЗ, добавьте вручную" : ""}
+                          InputProps={{ disableUnderline: true, sx: { borderRadius: 1.5, bgcolor: !data.tech_stack ? 'white' : 'grey.50', fontSize: '0.85rem', alignItems: 'flex-start' } }}
+                          FormHelperTextProps={{ sx: { ml: 0, mt: 1, color: 'text.secondary' } }}
+                        />
+                      </Collapse>
                     </Paper>
 
                     {/* 2.5. ТИП ПРОЕКТА (Col 1, Row 2) */}
@@ -790,20 +1227,16 @@ export default function AgentKP() {
                       />
                     </Paper>
 
-                    {/* 3. СУТЬ ПРОЕКТА (Full Width) */}
+                    {/* 3. СУТЬ ПРОЕКТА (Full Width) - НЕ кликабельна, цитаты не нужны */}
                     <Paper
                       elevation={0}
-                      onClick={() => setSelectedItem({ field: 'project_essence', text: data.project_essence, source: data._original?.project_essence?.source })}
                       sx={{
                         gridColumn: '1 / -1',
                         p: 3,
-                        bgcolor: selectedItem?.field === 'project_essence' ? 'rgba(25, 118, 210, 0.08)' : 'white',
+                        bgcolor: 'white',
                         borderRadius: 3,
                         border: '1px solid',
-                        borderColor: selectedItem?.field === 'project_essence' ? 'primary.main' : 'divider',
-                        cursor: 'pointer',
-                        transition: 'all 0.2s ease',
-                        '&:hover': { borderColor: 'primary.light' }
+                        borderColor: 'divider'
                       }}
                     >
                       <Typography variant="h6" fontWeight={600} gutterBottom>
@@ -817,61 +1250,77 @@ export default function AgentKP() {
                         minRows={2}
                         value={data.project_essence || ''}
                         onChange={(e) => setData({ ...data, project_essence: e.target.value })}
-                        onClick={(e) => e.stopPropagation()}
                         InputProps={{ disableUnderline: true, sx: { borderRadius: 2, bgcolor: 'grey.50' } }}
                       />
                     </Paper>
 
                     {/* 4. БИЗНЕС ЗАДАЧИ — список кликабельных пунктов */}
                     <Paper elevation={0} sx={{ gridColumn: '1 / -1', p: 3, bgcolor: 'white', borderRadius: 3, border: '1px solid', borderColor: 'divider' }}>
-                      <Typography variant="h6" fontWeight={600} gutterBottom>
-                        Бизнес-задачи
-                      </Typography>
+                      <Box display="flex" alignItems="center" gap={1} mb={2}>
+                        <Typography variant="h6" fontWeight={600}>
+                          Бизнес-задачи
+                        </Typography>
+                        <IconButton
+                          size="small"
+                          onClick={() => setEditMode({ ...editMode, business_goals: !editMode.business_goals })}
+                          sx={{ color: editMode.business_goals ? 'primary.main' : 'action.disabled', p: 0.5 }}
+                        >
+                          <Edit fontSize="small" />
+                        </IconButton>
+                      </Box>
                       <Box display="flex" flexDirection="column" gap={1}>
-                        {data._original?.business_goals?.map((item, idx) => {
-                          const issue = getIssueForItem('business_goals', item.text);
-                          const isSelected = selectedItem?.field === 'business_goals' && selectedItem?.text === item.text;
-                          return (
-                            <Box
-                              key={idx}
-                              onClick={() => setSelectedItem({ field: 'business_goals', text: item.text, source: item.source, issue })}
-                              sx={{
-                                p: 1.5,
-                                borderRadius: 1.5,
-                                cursor: 'pointer',
-                                border: '1px solid',
-                                borderColor: isSelected ? 'primary.main' : (issue ? (issue.type === 'impossible' ? '#D32F2F' : issue.type === 'contradictory' ? '#0288D1' : '#ED6C02') : 'divider'),
-                                bgcolor: isSelected ? 'rgba(25, 118, 210, 0.08)' : (issue ? (issue.type === 'impossible' ? '#FFEBEE' : issue.type === 'contradictory' ? '#E3F2FD' : '#FFF8E1') : 'grey.50'),
-                                transition: 'all 0.2s ease',
-                                '&:hover': { borderColor: issue ? undefined : 'primary.light', bgcolor: isSelected ? undefined : 'rgba(25, 118, 210, 0.04)' }
-                              }}
-                            >
-                              <Box display="flex" alignItems="center" gap={1}>
-                                {issue && (
-                                  issue.type === 'impossible' ? <ErrorIcon fontSize="small" sx={{ color: '#D32F2F' }} /> :
-                                    issue.type === 'contradictory' ? <SyncProblem fontSize="small" sx={{ color: '#0288D1' }} /> :
-                                      <Warning fontSize="small" sx={{ color: '#ED6C02' }} />
-                                )}
-                                <Typography variant="body2">{item.text}</Typography>
+                        {(() => {
+                          const businessGoalsItems = data._original?.business_goals?.length > 0
+                            ? data._original.business_goals
+                            : (data.business_goals ? data.business_goals.split('\n').filter(t => t.trim()).map(t => ({ text: t.trim(), source: '' })) : []);
+
+                          return businessGoalsItems.map((item, idx) => {
+                            const issue = getIssueForItem('business_goals', item.text);
+                            const isSelected = selectedItem?.field === 'business_goals' && selectedItem?.text === item.text;
+                            return (
+                              <Box
+                                key={idx}
+                                onClick={() => setSelectedItem({ field: 'business_goals', text: item.text, source: item.source_quote || item.source, page_number: item.page_number, rag_confidence: item.rag_confidence, issue })}
+                                sx={{
+                                  p: 1.5,
+                                  borderRadius: 1.5,
+                                  cursor: 'pointer',
+                                  border: '1px solid',
+                                  borderColor: isSelected ? 'primary.main' : (issue ? (issue.type === 'impossible' ? '#D32F2F' : issue.type === 'contradictory' ? '#0288D1' : '#ED6C02') : 'divider'),
+                                  bgcolor: isSelected ? 'rgba(25, 118, 210, 0.08)' : (issue ? (issue.type === 'impossible' ? '#FFEBEE' : issue.type === 'contradictory' ? '#E3F2FD' : '#FFF8E1') : 'grey.50'),
+                                  transition: 'all 0.2s ease',
+                                  '&:hover': { borderColor: issue ? undefined : 'primary.light', bgcolor: isSelected ? undefined : 'rgba(25, 118, 210, 0.04)' }
+                                }}
+                              >
+                                <Box display="flex" alignItems="center" gap={1}>
+                                  {issue && (
+                                    issue.type === 'impossible' ? <ErrorIcon fontSize="small" sx={{ color: '#D32F2F' }} /> :
+                                      issue.type === 'contradictory' ? <SyncProblem fontSize="small" sx={{ color: '#0288D1' }} /> :
+                                        <Warning fontSize="small" sx={{ color: '#ED6C02' }} />
+                                  )}
+                                  <Typography variant="body2">{item.text}</Typography>
+                                </Box>
                               </Box>
-                            </Box>
-                          );
-                        })}
+                            );
+                          });
+                        })()}
                       </Box>
                       {/* Текстовое поле для редактирования (сворачиваемое) */}
-                      <TextField
-                        fullWidth
-                        hiddenLabel
-                        multiline
-                        variant="filled"
-                        size="small"
-                        minRows={2}
-                        value={data.business_goals || ''}
-                        onChange={(e) => setData({ ...data, business_goals: e.target.value })}
-                        placeholder="Добавить/редактировать..."
-                        sx={{ mt: 2 }}
-                        InputProps={{ disableUnderline: true, sx: { borderRadius: 1.5, bgcolor: 'grey.50', fontSize: '0.85rem' } }}
-                      />
+                      <Collapse in={editMode.business_goals}>
+                        <TextField
+                          fullWidth
+                          hiddenLabel
+                          multiline
+                          variant="filled"
+                          size="small"
+                          minRows={2}
+                          value={data.business_goals || ''}
+                          onChange={(e) => setData({ ...data, business_goals: e.target.value })}
+                          placeholder="Добавить/редактировать..."
+                          sx={{ mt: 2 }}
+                          InputProps={{ disableUnderline: true, sx: { borderRadius: 1.5, bgcolor: 'grey.50', fontSize: '0.85rem' } }}
+                        />
+                      </Collapse>
                     </Paper>
 
                     {/* 5. КЛЮЧЕВОЙ ФУНКЦИОНАЛ — список кликабельных пунктов с категориями */}
@@ -885,11 +1334,22 @@ export default function AgentKP() {
                           size="small"
                           color="primary"
                         />
+                        <IconButton
+                          size="small"
+                          onClick={() => setEditMode({ ...editMode, key_features: !editMode.key_features })}
+                          sx={{ color: editMode.key_features ? 'primary.main' : 'action.disabled', p: 0.5 }}
+                        >
+                          <Edit fontSize="small" />
+                        </IconButton>
                       </Box>
 
                       {/* Категории */}
                       {(() => {
-                        const features = data._original?.key_features_flat || [];
+                        // Fallback: if _original.key_features_flat is empty, parse from text
+                        let features = data._original?.key_features_flat || [];
+                        if (features.length === 0 && data.key_features) {
+                          features = data.key_features.split('\n').filter(t => t.trim()).map(t => ({ text: t.trim(), source: '', category: null }));
+                        }
                         const categories = [...new Set(features.map(f => f.category).filter(Boolean))];
                         // Material 3 стиль категорий с иконками и цветами
                         const categoryConfig = {
@@ -910,7 +1370,7 @@ export default function AgentKP() {
                                 return (
                                   <Box
                                     key={idx}
-                                    onClick={() => setSelectedItem({ field: 'key_features', text: item.text, source: item.source, issue })}
+                                    onClick={() => setSelectedItem({ field: 'key_features', text: item.text, source: item.source_quote || item.source, page_number: item.page_number, rag_confidence: item.rag_confidence, issue })}
                                     sx={{
                                       p: 1.5,
                                       borderRadius: 1.5,
@@ -996,7 +1456,7 @@ export default function AgentKP() {
                                   return (
                                     <Box
                                       key={idx}
-                                      onClick={() => setSelectedItem({ field: 'key_features', text: item.text, source: item.source, issue, category: cat })}
+                                      onClick={() => setSelectedItem({ field: 'key_features', text: item.text, source: item.source_quote || item.source, page_number: item.page_number, rag_confidence: item.rag_confidence, issue, category: cat })}
                                       sx={{
                                         p: 1.25,
                                         borderRadius: 1.5,
@@ -1041,19 +1501,21 @@ export default function AgentKP() {
                         });
                       })()}
 
-                      <TextField
-                        fullWidth
-                        hiddenLabel
-                        multiline
-                        variant="filled"
-                        size="small"
-                        minRows={2}
-                        value={typeof data.key_features === 'string' ? data.key_features : ''}
-                        onChange={(e) => setData({ ...data, key_features: e.target.value })}
-                        placeholder="Добавить/редактировать..."
-                        sx={{ mt: 2 }}
-                        InputProps={{ disableUnderline: true, sx: { borderRadius: 1.5, bgcolor: 'white', fontSize: '0.85rem' } }}
-                      />
+                      <Collapse in={editMode.key_features}>
+                        <TextField
+                          fullWidth
+                          hiddenLabel
+                          multiline
+                          variant="filled"
+                          size="small"
+                          minRows={2}
+                          value={typeof data.key_features === 'string' ? data.key_features : ''}
+                          onChange={(e) => setData({ ...data, key_features: e.target.value })}
+                          placeholder="Добавить/редактировать..."
+                          sx={{ mt: 2 }}
+                          InputProps={{ disableUnderline: true, sx: { borderRadius: 1.5, bgcolor: 'white', fontSize: '0.85rem' } }}
+                        />
+                      </Collapse>
                     </Paper>
 
                     {/* 6. ИНТЕГРАЦИИ — список кликабельных пунктов */}
@@ -1062,32 +1524,45 @@ export default function AgentKP() {
                         Интеграции
                       </Typography>
                       <Box display="flex" flexWrap="wrap" gap={1}>
-                        {data._original?.client_integrations?.map((item, idx) => {
-                          const issue = getIssueForItem('client_integrations', item.text);
-                          const isSelected = selectedItem?.field === 'client_integrations' && selectedItem?.text === item.text;
-                          return (
-                            <Chip
-                              key={idx}
-                              label={item.text}
-                              onClick={() => setSelectedItem({ field: 'client_integrations', text: item.text, source: item.source, issue })}
-                              icon={issue ? (
-                                issue.type === 'impossible' ? <ErrorIcon fontSize="small" /> :
-                                  issue.type === 'contradictory' ? <SyncProblem fontSize="small" /> :
-                                    <Warning fontSize="small" />
-                              ) : undefined}
-                              sx={{
-                                cursor: 'pointer',
-                                borderColor: isSelected ? 'primary.main' : undefined,
-                                bgcolor: issue ? (issue.type === 'impossible' ? '#FFEBEE' : issue.type === 'contradictory' ? '#E3F2FD' : '#FFF8E1') : undefined,
-                                '& .MuiChip-icon': {
-                                  color: issue?.type === 'impossible' ? '#D32F2F' : issue?.type === 'contradictory' ? '#0288D1' : '#ED6C02'
-                                }
-                              }}
-                              variant={isSelected ? 'filled' : 'outlined'}
-                              color={isSelected ? 'primary' : 'default'}
-                            />
-                          );
-                        })}
+                        {(() => {
+                          const integrationsItems = data._original?.client_integrations?.length > 0
+                            ? data._original.client_integrations
+                            : (data.client_integrations ? data.client_integrations.split('\n').filter(t => t.trim()).map(t => ({ text: t.trim(), source: '' })) : []);
+
+                          return integrationsItems.map((item, idx) => {
+                            const issue = getIssueForItem('client_integrations', item.text);
+                            const isSelected = selectedItem?.field === 'client_integrations' && selectedItem?.text === item.text;
+                            return (
+                              <Chip
+                                key={idx}
+                                label={item.text}
+                                onClick={() => setSelectedItem({ field: 'client_integrations', text: item.text, source: item.source_quote || item.source, page_number: item.page_number, rag_confidence: item.rag_confidence, issue })}
+                                icon={issue ? (
+                                  issue.type === 'impossible' ? <ErrorIcon fontSize="small" /> :
+                                    issue.type === 'contradictory' ? <SyncProblem fontSize="small" /> :
+                                      <Warning fontSize="small" />
+                                ) : undefined}
+                                sx={{
+                                  cursor: 'pointer',
+                                  height: 'auto',
+                                  py: 0.5,
+                                  '& .MuiChip-label': {
+                                    display: 'block',
+                                    whiteSpace: 'normal',
+                                    overflow: 'visible'
+                                  },
+                                  borderColor: isSelected ? 'primary.main' : undefined,
+                                  bgcolor: issue ? (issue.type === 'impossible' ? '#FFEBEE' : issue.type === 'contradictory' ? '#E3F2FD' : '#FFF8E1') : undefined,
+                                  '& .MuiChip-icon': {
+                                    color: issue?.type === 'impossible' ? '#D32F2F' : issue?.type === 'contradictory' ? '#0288D1' : '#ED6C02'
+                                  }
+                                }}
+                                variant={isSelected ? 'filled' : 'outlined'}
+                                color={isSelected ? 'primary' : 'default'}
+                              />
+                            );
+                          });
+                        })()}
                       </Box>
                       <TextField
                         fullWidth
@@ -1104,142 +1579,132 @@ export default function AgentKP() {
                       />
                     </Paper>
 
-                    {/* 7. ДЕТАЛЬНЫЙ АНАЛИЗ (RAG) */}
-                    {detailedRequirements.length > 0 && (
-                      <Paper elevation={0} sx={{ gridColumn: '1 / -1', p: 3, bgcolor: '#E3F2FD', borderRadius: 3, border: '1px solid', borderColor: '#90CAF9' }}>
-                        <Box display="flex" alignItems="center" gap={1} mb={2}>
-                          <CheckCircle sx={{ color: '#1976D2' }} />
-                          <Typography variant="h6" fontWeight={600} color="#0D47A1">
-                            Детальный анализ требований (Reverse RAG)
-                          </Typography>
-                        </Box>
-
-                        <Box display="flex" flexWrap="wrap" gap={1}>
-                          {detailedRequirements.map((item, idx) => {
-                            const isSelected = selectedItem?.field === 'detailed_req' && selectedItem?.text === item.summary;
-                            return (
-                              <Chip
-                                key={idx}
-                                label={item.summary}
-                                onClick={() => setSelectedItem({
-                                  field: 'detailed_req',
-                                  text: item.summary,
-                                  source: item.source_text,
-                                  // Custom metadata for Side Panel
-                                  meta: {
-                                    page: item.page_number,
-                                    score: item.confidence_score,
-                                    category: item.category,
-                                    importance: item.importance
-                                  }
-                                })}
-                                variant={isSelected ? 'filled' : 'outlined'}
-                                color="primary"
-                                sx={{
-                                  bgcolor: isSelected ? 'primary.main' : 'white',
-                                  color: isSelected ? 'white' : 'primary.main', // Explicit contrast
-                                  borderColor: isSelected ? 'primary.main' : '#BBDEFB',
-                                  '&:hover': {
-                                    bgcolor: isSelected ? 'primary.dark' : '#BBDEFB',
-                                    color: isSelected ? 'white' : 'primary.dark'
-                                  }
-                                }}
-                              />
-                            );
-                          })}
-                        </Box>
-                      </Paper>
-                    )}
-
                   </Box>
-                </Container>
+                </Box>
               </Box>
 
               {/* Правая часть: Боковая панель с цитатами из ТЗ */}
               <Box
                 sx={{
-                  flex: 1,
                   display: { xs: 'none', lg: 'block' },
                   position: 'sticky',
-                  top: 80,
-                  alignSelf: 'flex-start',
-                  maxHeight: 'calc(100vh - 100px)',
-                  overflow: 'auto',
-                  minWidth: 350,
-                  zIndex: 1
+                  top: 100,
+                  maxHeight: 'calc(100vh - 120px)',
+                  overflow: 'auto'
                 }}
               >
                 <Paper
                   elevation={0}
                   sx={{
                     p: 2.5,
-                    bgcolor: '#F5F5F5',
-                    borderRadius: 2,
+                    bgcolor: '#FAFAFA',
+                    borderRadius: 3,
                     border: '1px solid',
-                    borderColor: 'divider',
-                    // Prevent overlapping
-                    maxWidth: 350
+                    borderColor: 'divider'
                   }}
                 >
-                  <Typography variant="subtitle2" color="text.secondary" sx={{ mb: 2, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                  <Typography variant="subtitle2" color="text.secondary" sx={{ mb: 2, textTransform: 'uppercase', letterSpacing: '0.05em', fontSize: '0.7rem' }}>
                     Источник в ТЗ
                   </Typography>
 
-                  {selectedItem && selectedItem.source ? (
+                  {selectedItem ? (
                     <Box>
-                      <Chip
-                        label={selectedItem.field?.replace(/_/g, ' ') || 'пункт'}
-                        size="small"
-                        color="primary"
-                        sx={{ mb: 1.5, textTransform: 'capitalize' }}
-                      />
-
-                      {/* RAG Metadata Badge */}
-                      {selectedItem.meta && (
-                        <Box display="inline-flex" gap={1} ml={1} mb={1.5} alignItems="center">
-                          {selectedItem.meta.page && (
-                            <Chip label={`Стр. ${selectedItem.meta.page}`} size="small" variant="outlined" color="default" />
-                          )}
-                          {selectedItem.meta.category && (
-                            <Chip label={selectedItem.meta.category} size="small" variant="outlined" color="secondary" />
-                          )}
-                        </Box>
-                      )}
+                      {/* Material 3 styled metadata row */}
+                      <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.75, mb: 2 }}>
+                        <Chip
+                          label={selectedItem.field?.replace(/_/g, ' ') || 'пункт'}
+                          size="small"
+                          sx={{
+                            textTransform: 'capitalize',
+                            bgcolor: 'primary.main',
+                            color: 'white',
+                            fontWeight: 500,
+                            fontSize: '0.7rem',
+                            height: 24
+                          }}
+                        />
+                        {selectedItem.page_number && selectedItem.page_number > 0 && (
+                          <Chip
+                            label={`Страница ${selectedItem.page_number}`}
+                            size="small"
+                            sx={{
+                              bgcolor: '#E3F2FD',
+                              color: '#1565C0',
+                              fontWeight: 500,
+                              fontSize: '0.7rem',
+                              height: 24,
+                              '& .MuiChip-label': { px: 1.5 }
+                            }}
+                          />
+                        )}
+                        {selectedItem.rag_confidence && (
+                          <Chip
+                            label={`${Math.round(selectedItem.rag_confidence * 100)}%`}
+                            size="small"
+                            sx={{
+                              bgcolor: selectedItem.rag_confidence > 0.7 ? '#E8F5E9' : '#FFF3E0',
+                              color: selectedItem.rag_confidence > 0.7 ? '#2E7D32' : '#E65100',
+                              fontWeight: 600,
+                              fontSize: '0.7rem',
+                              height: 24
+                            }}
+                          />
+                        )}
+                      </Box>
 
                       <Typography variant="body2" sx={{ mb: 1.5, fontWeight: 500 }}>
                         {selectedItem.text}
                       </Typography>
                       <Divider sx={{ mb: 1.5 }} />
-                      <Paper
-                        elevation={0}
-                        sx={{
-                          p: 2,
-                          bgcolor: 'white',
-                          borderRadius: 1.5,
-                          border: '1px solid',
-                          borderColor: 'divider'
-                        }}
-                      >
-                        <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 1 }}>
-                          Цитата из ТЗ:
-                        </Typography>
-                        <Typography
-                          variant="body2"
+
+                      {selectedItem.source ? (
+                        <Paper
+                          elevation={0}
                           sx={{
-                            whiteSpace: 'pre-wrap',
-                            fontFamily: 'monospace',
-                            fontSize: '0.8rem',
-                            lineHeight: 1.6,
-                            color: 'text.primary',
-                            bgcolor: '#FFFDE7',
-                            p: 1.5,
-                            borderRadius: 1,
-                            borderLeft: '3px solid #FFC107'
+                            p: 2,
+                            bgcolor: 'white',
+                            borderRadius: 1.5,
+                            border: '1px solid',
+                            borderColor: 'divider'
                           }}
                         >
-                          "{selectedItem.source}"
-                        </Typography>
-                      </Paper>
+                          <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 1 }}>
+                            Цитата из ТЗ:
+                          </Typography>
+                          <Typography
+                            variant="body2"
+                            sx={{
+                              whiteSpace: 'pre-wrap',
+                              fontFamily: 'monospace',
+                              fontSize: '0.8rem',
+                              lineHeight: 1.6,
+                              color: 'text.primary',
+                              bgcolor: '#FFFDE7',
+                              p: 1.5,
+                              borderRadius: 1,
+                              borderLeft: '3px solid #FFC107'
+                            }}
+                          >
+                            "{selectedItem.source}"
+                          </Typography>
+                        </Paper>
+                      ) : (
+                        <Paper
+                          elevation={0}
+                          sx={{
+                            p: 2,
+                            bgcolor: '#FFF3E0',
+                            borderRadius: 1.5,
+                            border: '1px solid',
+                            borderColor: '#FFCC80'
+                          }}
+                        >
+                          <Typography variant="body2" color="text.secondary" sx={{ fontStyle: 'italic' }}>
+                            Не удалось найти точное совпадение в исходном ТЗ
+                          </Typography>
+                        </Paper>
+                      )}
+
                       {/* Если есть issue для этого пункта */}
                       {selectedItem.issue && (
                         <Alert
@@ -1286,8 +1751,19 @@ export default function AgentKP() {
                 onDeleteRole={handleDeleteRole}
               />
 
-              {/* Кнопка утверждения */}
-              <Box display="flex" justifyContent="flex-end" mt={3}>
+              {/* Кнопки действий */}
+              <Box display="flex" justifyContent="flex-end" gap={2} mt={3}>
+                {/* Show "Return to Old KP" only if we have a cached one */}
+                {cachedFinalDoc && (
+                  <Button
+                    variant="outlined"
+                    size="large"
+                    onClick={handleReturnToOldKP}
+                    sx={{ px: 3, py: 1.5 }}
+                  >
+                    Вернуться к старому КП
+                  </Button>
+                )}
                 <Button
                   variant="contained"
                   size="large"
@@ -1295,7 +1771,7 @@ export default function AgentKP() {
                   startIcon={<CheckCircle />}
                   sx={{ px: 5, py: 1.5 }}
                 >
-                  Утвердить и сгенерировать КП
+                  {cachedFinalDoc ? 'Сгенерировать новое КП' : 'Утвердить и сгенерировать КП'}
                 </Button>
               </Box>
             </Container>
@@ -1389,6 +1865,15 @@ export default function AgentKP() {
                   sx={{ px: 4 }}
                 >
                   Скачать .docx
+                </Button>
+
+                <Button
+                  variant="outlined"
+                  size="large"
+                  startIcon={<Edit />}
+                  onClick={handleReturnToAnalysis}
+                >
+                  Вернуться к анализу
                 </Button>
 
                 <Button

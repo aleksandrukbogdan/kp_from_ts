@@ -10,5 +10,5 @@ fastapi
 python-multipart
 markdown
 beautifulsoup4
-docling
 
+sqlalchemy>=2.0

@@ -12,6 +12,10 @@ services:
     command: sh -c "npm install && npm run dev -- --host"
     ports:
       - "8090:5173" # Доступ к сайту через http://IP:8090
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
     depends_on:
       - api
     networks:
@@ -35,6 +39,7 @@ services:
       - ai_platform_network
     volumes:
       - ./shared_data:/shared_data
+      - ./data:/data
       - ./:/app
 
   # 3. Worker (Python Temporal Worker)
@@ -55,13 +60,13 @@ services:
     deploy:
       resources:
         limits:
-          memory: 8G
+          memory: 32G
         reservations:
-          memory: 4G
-          # devices:
-          #   - driver: nvidia
-          #     count: 1
-          #     capabilities: [gpu]
+          memory: 8G
+          devices:
+            - driver: nvidia
+              device_ids: [ '1' ] # Только GPU 1, GPU 0 остаётся свободной (qwen)
+              capabilities: [ gpu ]
           # 4. Temporal Server
   temporal-server:
     image: temporalio/admin-tools:latest

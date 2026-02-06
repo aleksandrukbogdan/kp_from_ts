@@ -206,7 +206,7 @@ function App() {
           {/* Главная страница -> Портал */}
           <Route path="/" element={<Portal />} />
 
-          {/* Страница приложения -> Агент КП */}
+          {/* Страница приложения -> Агент КП (с встроенной историей) */}
           <Route path="/agent-kp" element={<AgentKP />} />
         </Routes>
       </BrowserRouter>

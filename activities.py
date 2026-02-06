@@ -11,6 +11,11 @@ from temporalio import activity
 from typing import List, Dict, Optional, Any
 
 from dotenv import load_dotenv
+import logging
+
+# Suppress annoying RapidOCR warnings
+logging.getLogger("RapidOCR").setLevel(logging.ERROR)
+logging.getLogger("rapidocr").setLevel(logging.ERROR)
 
 # New Modules
 from llm_service import LLMService
@@ -42,25 +47,34 @@ def get_docling_converter():
             return _doc_converter
 
         # --- Docling Integration ---
-        from docling.datamodel.base_models import InputFormat
-        from docling.document_converter import DocumentConverter, PdfFormatOption
-        from docling.datamodel.pipeline_options import PdfPipelineOptions, AcceleratorOptions, AcceleratorDevice
-
-        is_dev = os.getenv("IS_DEV", "false").lower() == "true"
-        
         try:
-            # Pipeline Setup
+            from docling.datamodel.base_models import InputFormat
+            from docling.document_converter import DocumentConverter, PdfFormatOption
+            from docling.datamodel.pipeline_options import PdfPipelineOptions, AcceleratorOptions, AcceleratorDevice
+            
+            is_dev = os.getenv("IS_DEV", "false").lower() == "true"
+            
+            # Setup Pipeline with potential CUDA support
             pipeline_options = PdfPipelineOptions()
             pipeline_options.do_ocr = True
             pipeline_options.do_table_structure = True
             pipeline_options.table_structure_options.do_cell_matching = True
             
-            # Accelerator Setup
-            device = AcceleratorDevice.CPU if is_dev else AcceleratorDevice.CUDA
-            print(f"Docling initialising... IS_DEV={is_dev}, Device={device}")
+            # Smart Device Selection
+            try:
+                import torch
+                if not is_dev and torch.cuda.is_available():
+                     device = AcceleratorDevice.CUDA
+                     print("Docling: Using CUDA (H100/GPU detected).")
+                else:
+                     device = AcceleratorDevice.CPU
+                     print("Docling: Using CPU.")
+            except ImportError:
+                 device = AcceleratorDevice.CPU
+                 print("Docling: Torch generic check failed, using CPU.")
             
             pipeline_options.accelerator_options = AcceleratorOptions(
-                num_threads=4, device=device
+                num_threads=32, device=device
             )
 
             _doc_converter = DocumentConverter(
@@ -68,23 +82,97 @@ def get_docling_converter():
                     InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
                 }
             )
+            print("Docling initialized successfully.")
+
+        except ImportError as e:
+            print(f"Docling Import Error: {e}. Check if 'docling' is in requirements.txt and installed.")
+            # We can't return a converter if we can't import the class, so we might return None or raise
+            # But the fallback below uses DocumentConverter() which ALSO needs the import? 
+            # If import fails, we are dead in the water for Docling.
+            # But maybe the user has an old version? 
+            # Re-raising ensures we see the log.
+            # However, to be safe for the 'parse_file_activity' let's allow it to fail there or return a dummy if completely missing.
+            # Raising is better so the user knows.
+            raise RuntimeError(f"Docling libraries missing: {e}") from e
+
         except Exception as e:
-            print(f"Docling Init Error: {e}. using fallback.")
-            _doc_converter = DocumentConverter() # Fallback
+            print(f"Docling Init Error (Configuration): {e}. Attempting fallback to default CPU config.")
+            try:
+                # Fallback to simplest possible init
+                _doc_converter = DocumentConverter()
+                print("Docling fallback initialized.")
+            except Exception as e2:
+                print(f"Docling Fallback Failed: {e2}")
+                raise e2
         
         return _doc_converter
 
+def _convert_docx_to_pdf(docx_path: Path) -> Path:
+    """Convert DOCX to PDF using LibreOffice. Returns path to PDF file."""
+    import subprocess
+    
+    output_dir = docx_path.parent
+    pdf_path = output_dir / f"{docx_path.stem}.pdf"
+    
+    # LibreOffice command for headless conversion
+    cmd = [
+        "libreoffice",
+        "--headless",
+        "--convert-to", "pdf",
+        "--outdir", str(output_dir),
+        str(docx_path)
+    ]
+    
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if result.returncode != 0:
+            print(f"LibreOffice conversion failed: {result.stderr}")
+            return None
+        
+        if pdf_path.exists():
+            print(f"DOCX→PDF conversion successful: {pdf_path}")
+            return pdf_path
+        else:
+            print(f"PDF file not created at expected path: {pdf_path}")
+            return None
+    except subprocess.TimeoutExpired:
+        print("LibreOffice conversion timed out (120s)")
+        return None
+    except FileNotFoundError:
+        print("LibreOffice not found. Install with: apt install libreoffice-writer")
+        return None
+    except Exception as e:
+        print(f"DOCX→PDF conversion error: {e}")
+        return None
+
+
 @activity.defn
-async def parse_file_activity(file_path:str, file_name:str) -> str:
-    """Parses document via Docling and saves Markdown to a file. Returns path to MD file."""
+async def parse_file_activity(file_path: str, file_name: str, convert_to_pdf_for_pages: bool = True) -> str:
+    """Parses document via Docling and saves Markdown to a file. Returns path to MD file.
+    
+    Args:
+        file_path: Path to the document
+        file_name: Original filename
+        convert_to_pdf_for_pages: If True, converts DOCX to PDF before parsing to enable page number extraction
+    """
     doc_converter = get_docling_converter()
     input_path = Path(file_path)
+    original_path = input_path  # Keep for reference
+
+    # DOCX → PDF conversion for page numbers
+    if convert_to_pdf_for_pages and file_path.lower().endswith(('.docx', '.doc')):
+        activity.logger.info(f"Converting DOCX to PDF for page number extraction: {file_path}")
+        pdf_path = await asyncio.to_thread(_convert_docx_to_pdf, input_path)
+        if pdf_path:
+            input_path = pdf_path
+            activity.logger.info(f"Using converted PDF: {pdf_path}")
+        else:
+            activity.logger.warning("DOCX→PDF conversion failed, continuing with original DOCX (no page numbers)")
 
     try:
-        activity.logger.info(f"Docling: Starting parsing for {file_path}...")
+        activity.logger.info(f"Docling: Starting parsing for {input_path}...")
         
         # Offload CPU-bound task to a separate thread to prevent blocking Temporal heartbeat
-        # We need to wrap the sync call
         def _run_docling():
             return doc_converter.convert(input_path)
 
@@ -133,29 +221,65 @@ async def parse_file_activity(file_path:str, file_name:str) -> str:
 
 @activity.defn
 async def ocr_document_activity(file_path: str) -> str:
-    """Fallback OCR if standard parsing fails."""
+    """Fallback OCR if standard parsing fails. Handles Images and PDFs."""
     try:
-        with open(file_path, "rb") as f:
-            file_bytes = f.read()
+        import mimetypes
+        from pdf2image import convert_from_path
 
-        base64_image = base64.b64encode(file_bytes).decode('utf-8')
+        # Determine if it's a PDF
+        mime_type, _ = mimetypes.guess_type(file_path)
+        is_pdf = mime_type == 'application/pdf' or file_path.lower().endswith('.pdf')
         
-        messages = [{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": "Transcribe ALL text from this image exactly as it appears. Detect layout if possible."},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}},
-            ],
-        }]
+        images_to_process = []
+        
+        if is_pdf:
+            activity.logger.info(f"OCR: Converting PDF to images: {file_path}")
+            # Convert first 5 pages max to avoid overload
+            # fmt='jpeg' matches the data url we generally use
+            try:
+                images = convert_from_path(file_path, first_page=1, last_page=5, fmt='jpeg')
+                for img in images:
+                    # Save to bytes
+                    buf = io.BytesIO()
+                    img.save(buf, format='JPEG')
+                    images_to_process.append(buf.getvalue())
+            except Exception as e:
+                activity.logger.error(f"PDF to Image Conversion failed: {e}")
+                return ""
+        else:
+            # Assume it's an image file
+            with open(file_path, "rb") as f:
+                images_to_process.append(f.read())
 
+        combined_text = ""
         llm = LLMService()
-        text = await llm.create_chat_completion(messages=messages)
-        
-        # Save OCR result to file as well
+
+        # Process each page/image
+        for i, img_bytes in enumerate(images_to_process):
+            base64_image = base64.b64encode(img_bytes).decode('utf-8')
+            
+            messages = [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": f"Page {i+1}. Transcribe ALL text from this image exactly as it appears. Detect layout if possible."},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}},
+                ],
+            }]
+            
+            try:
+                text = await llm.create_chat_completion(messages=messages)
+                combined_text += f"\n\n--- Page {i+1} ---\n\n{text}"
+            except Exception as e:
+                activity.logger.error(f"OCR Failed for page {i+1}: {e}")
+
+        if not combined_text:
+            return ""
+
+        # Save OCR result to file
         input_path = Path(file_path)
         md_path = input_path.parent / f"{input_path.stem}_ocr.md"
         with open(md_path, "w", encoding="utf-8") as f:
-            f.write(text)
+            f.write(combined_text)
             
         return str(md_path)
         
@@ -169,21 +293,69 @@ async def save_budget_stub(data: dict) -> str:
     print(f'Stub saving to Postgres: {data}')
     return "ok"
 
+def _load_reference_data() -> dict:
+    """Загружает справочные данные из JSON (парсинг Расчёты по проектам.xlsx)."""
+    reference_path = Path(__file__).parent / "reference_data.json"
+    if not reference_path.exists():
+        return {}
+    try:
+        with open(reference_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"Failed to load reference_data.json: {e}")
+        return {}
+
+def _format_reference_for_prompt(reference: dict, max_projects: int = 3) -> str:
+    """Форматирует справочные данные для включения в промпт LLM."""
+    if not reference or "projects" not in reference:
+        return ""
+    
+    lines = ["СПРАВОЧНИК КОМПАНИИ (исторические данные по проектам):"]
+    lines.append(f"Типовые ставки: Менеджер={reference.get('rates', {}).get('Менеджер', 1700)}₽/ч, "
+                 f"ML-инженер={reference.get('rates', {}).get('ML-инженер', 1200)}₽/ч, "
+                 f"Тестировщик={reference.get('rates', {}).get('Тестировщик', 1600)}₽/ч")
+    lines.append("")
+    
+    for proj in reference.get("projects", [])[:max_projects]:
+        lines.append(f"## {proj['project_name']}")
+        for stage in proj.get("stages", []):
+            hours = stage.get("hours", {})
+            hours_str = ", ".join([f"{r}:{h}ч" for r, h in hours.items() if h > 0])
+            if hours_str:
+                lines.append(f"  - {stage['stage']}: {hours_str}")
+        lines.append("")
+    
+    return "\n".join(lines)
+
 @activity.defn
 async def estimate_hours_activity(tz_data: dict, stages: list, roles: list) -> dict:
     """
     Generates Budget Matrix: Stage -> Role -> Hours
+    Uses reference_data.json as context for more accurate estimates.
     """
     llm = LLMService()
     
+    # Load reference data from parsed Excel
+    reference = _load_reference_data()
+    reference_context = _format_reference_for_prompt(reference)
+    
     try:
-        activity.logger.info("Starting Budget Estimation")
-        budget_result: BudgetResult = await llm.create_structured_completion(
-            messages=[
-                {"role": "system", "content": "Ты Project Manager. Оцени трудозатраты в часах для каждого этапа и роли. "
-                                              "Используй ТОЛЬКО предложенные этапы и роли. Отвечай на РУССКОМ (названия могут быть англ, но суть русская)."},
-                {"role": "user", "content": f"""
-Проект: {tz_data.get('project_essence', 'N/A')}
+        activity.logger.info("Starting Budget Estimation with reference data")
+        
+        system_prompt = """Ты Project Manager с доступом к историческим данным компании.
+Оцени трудозатраты в часах для каждого этапа и роли.
+
+ПРАВИЛА:
+1. Используй ТОЛЬКО предложенные этапы и роли.
+2. Ориентируйся на справочные данные компании — там реальные часы с прошлых проектов.
+3. Если этап похож на типовой из справочника — бери часы оттуда как базу.
+4. Если этап уникален — оценивай по аналогии с похожими.
+5. Отвечай на РУССКОМ."""
+
+        user_prompt = f"""{reference_context}
+
+ТЕКУЩИЙ ПРОЕКТ:
+Суть: {tz_data.get('project_essence', 'N/A')}
 Стек: {tz_data.get('tech_stack', [])}
 
 Этапы (stages): {stages}
@@ -192,7 +364,12 @@ async def estimate_hours_activity(tz_data: dict, stages: list, roles: list) -> d
 Заполни матрицу часов:
 Для КАЖДОГО этапа из списка Stages укажи часы для КАЖДОЙ роли из списка Roles.
 Если роль не участвует в этапе, ставь 0.
-                """}
+Опирайся на справочные данные выше!"""
+
+        budget_result: BudgetResult = await llm.create_structured_completion(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
             ],
             output_model=BudgetResult,
             tool_name="submit_budget"
@@ -369,14 +546,18 @@ async def index_document_activity(md_file_path: str) -> List[Dict[str, Any]]:
                 # For this MVP: Use the 'texts' array if present, usually distinct elements.
                 if 'texts' in data:
                      for item in data['texts']:
-                         # item structure depends on version, usually {'text': '...', 'prov': [{'page_no': 1, 'bbox': ...}]}
+                         # item structure depends on version:
+                         # {'text': '...', 'prov': [{'page_no': 1, 'bbox': ...}]} OR
+                         # {'text': '...', 'prov': [{'page': 1, 'bbox': ...}]}
                          text_content = item.get('text', '').strip()
                          if len(text_content) > 20: # Skip noise
                              prov_list = item.get('prov') or [{}]
                              prov = prov_list[0]
+                             # Try multiple possible keys for page number
+                             page_num = prov.get('page_no') or prov.get('page_number') or prov.get('page') or 0
                              rag_chunks.append({
                                  "text": text_content,
-                                 "page_number": prov.get('page_no', 1),
+                                 "page_number": page_num,
                                  "bbox": str(prov.get('bbox', [])),
                                  "source_file": str(input_path.name)
                              })
@@ -402,7 +583,7 @@ async def index_document_activity(md_file_path: str) -> List[Dict[str, Any]]:
             from rag_service import RAGService
             rag = RAGService()
             # Use workflow_id as the table name for isolation
-            wf_id = activity.info().workflow_execution.workflow_id
+            wf_id = activity.info().workflow_id
             # Sanitize just in case, though Temporal IDs are usually safe strings
             table_name = f"req_{wf_id.replace('-', '_')}"
             
@@ -434,7 +615,7 @@ async def refine_requirements_activity(requirements: List[dict]) -> List[dict]:
     """
     from rag_service import RAGService
     rag = RAGService()
-    wf_id = activity.info().workflow_execution.workflow_id
+    wf_id = activity.info().workflow_id
     table_name = f"req_{wf_id.replace('-', '_')}"
     
     refined_list = []
@@ -463,6 +644,71 @@ async def refine_requirements_activity(requirements: List[dict]) -> List[dict]:
             refined_list.append(item_dict) # Keep original on error
 
     return refined_list
+
+
+@activity.defn
+async def enrich_with_rag_activity(merged_data: dict) -> dict:
+    """
+    Enriches all SourceText items with RAG source quotes.
+    Uses the item's 'text' field as the search query (NotebookLM-style).
+    """
+    from rag_service import RAGService
+    rag = RAGService()
+    wf_id = activity.info().workflow_id
+    table_name = f"req_{wf_id.replace('-', '_')}"
+    
+    activity.logger.info(f"Starting RAG enrichment for all fields...")
+    
+    async def enrich_item(item: dict) -> dict:
+        """Enrich a single SourceText item with RAG lookup."""
+        if not item or not isinstance(item, dict):
+            return item
+        
+        query = item.get('text', '')
+        if not query or len(query) < 5:  # Skip very short queries
+            return item
+        
+        try:
+            matches = await asyncio.to_thread(rag.search, query, table_name=table_name, top_k=1)
+            
+            if matches:
+                match = matches[0]
+                # Calculate confidence from distance (lower distance = higher confidence)
+                distance = match.get('_distance', 0.5)
+                confidence = max(0.0, 1.0 - distance)
+                
+                # Only enrich if we have a good match (confidence > 0.3)
+                if confidence > 0.3:
+                    item['source_quote'] = match.get('text', '')
+                    item['page_number'] = match.get('page_number')
+                    item['rag_confidence'] = round(confidence, 2)
+        except Exception as e:
+            activity.logger.warning(f"RAG lookup failed for '{query[:50]}...': {e}")
+        
+        return item
+    
+    # Enrich simple list fields
+    for field in ['business_goals', 'tech_stack', 'client_integrations']:
+        items = merged_data.get(field, [])
+        if isinstance(items, list):
+            enriched_items = []
+            for item in items:
+                enriched_items.append(await enrich_item(item))
+            merged_data[field] = enriched_items
+    
+    # Enrich key_features (nested structure with categories)
+    key_features = merged_data.get('key_features', {})
+    if isinstance(key_features, dict):
+        for category, items in key_features.items():
+            if isinstance(items, list):
+                enriched_items = []
+                for item in items:
+                    enriched_items.append(await enrich_item(item))
+                key_features[category] = enriched_items
+        merged_data['key_features'] = key_features
+    
+    activity.logger.info("RAG enrichment complete.")
+    return merged_data
 
 @activity.defn
 async def extract_chunk_activity(chunk_def: Dict[str, Any]) -> dict:
@@ -588,14 +834,13 @@ async def merge_data_activity(data_list: List[dict]) -> dict:
         return ExtractedTZData(project_essence=SourceText(text=f"Merge Error: {e}")).model_dump()
 
 @activity.defn
-async def analyze_project_activity(merged_data: dict, requirements_analysis: List[dict] = []) -> dict:
+async def analyze_project_activity(merged_data: dict) -> dict:
     """
     Phase 2: Analysis based on aggregated data.
     Populates requirement_issues, suggested_stages, suggested_roles, and estimates.
     """
     llm = LLMService()
     
-    # We rely on the structured extracted data.
     # START OPTIMIZATION: Filter context to avoid 50k+ char payloads
     condensed_data = {
         "project_essence": merged_data.get("project_essence", ""),
@@ -603,19 +848,9 @@ async def analyze_project_activity(merged_data: dict, requirements_analysis: Lis
         "business_goals": merged_data.get("business_goals", ""),
         "tech_stack": merged_data.get("tech_stack", []),
         "key_features": merged_data.get("key_features", {}), 
-        # Exclude 'client_integrations' if it's just raw text, or keep if crucial. 
-        # 'screens', 'reports' inside key_features might be enough.
     }
     
     context_json = json.dumps(condensed_data, indent=2, ensure_ascii=False)
-    
-    # Prepare RAG context (simplified)
-    rag_context = ""
-    if requirements_analysis:
-        rag_context = "\n=== DETAILED REQUIREMENTS WITH PROOF (RAG) ===\n"
-        for i, item in enumerate(requirements_analysis[:50]): # Limit to top 50 to avoid context overflow
-            rag_context += f"{i+1}. {item.get('summary')} (Page {item.get('page_number')})\n"
-            rag_context += f"   Proof: \"{item.get('source_text', '')[:200]}...\"\n"
     # END OPTIMIZATION
     
     try:
@@ -627,8 +862,6 @@ async def analyze_project_activity(merged_data: dict, requirements_analysis: Lis
 Данные проекта (извлеченные из ТЗ):
 {context_json}
 
-{rag_context}
-
 Задачи:
 1. Найди проблемные требования (неясные, противоречивые) в extracted data.
 2. Предложи этапы разработки и роли.
@@ -638,12 +871,6 @@ async def analyze_project_activity(merged_data: dict, requirements_analysis: Lis
 - Поле "item_text" должно содержать ТОЛЬКО текст требования (например: "Система должна работать офлайн"). 
 - НЕ пиши туда JSON или Python-объекты вроде "text='...' source='...'".
 - Если проблема общая, напиши суть своими словами.
-
-ВАЖНО ДЛЯ key_features (INTELLIGENT MERGE):
-- Теперь у тебя есть "DETAILED REQUIREMENTS WITH PROOF".
-- Когда ты формируешь список `key_features`, старайся находить соответствия в RAG-данных.
-- Если находишь — добавляй `source_quote` (цитату) и `page_number` в объект key_feature.
-- Если функция уникальна и подтверждена цитатой, это повышает доверие!
                 """}
             ],
             output_model=AnalysisTZResult,

@@ -167,16 +167,14 @@ class LLMService:
                 logger.error(f"Validation/Parsing Error: {e}.")
                 
                 # Self-correction: Feed error back to the model
+                # NOTE: Do NOT append the full response to avoid exponential context growth
                 if attempt < max_retries - 1:
                     logger.info("Feeding error back to model for self-correction...")
-                    current_messages.append({
-                        "role": "assistant",
-                        "content": raw_content # Use captured content
-                    })
                     error_feedback = str(e)[:500]
+                    # Instead of appending response + error, just add a simple retry prompt
                     current_messages.append({
                         "role": "user",
-                        "content": f"Ошибка валидации: {error_feedback}\n\nИсправь JSON и верни ТОЛЬКО валидный ответ без markdown-разметки."
+                        "content": f"Предыдущий ответ содержал ошибку JSON: {error_feedback}\n\nПопробуй снова. Верни ТОЛЬКО валидный JSON без markdown-разметки."
                     })
                     await asyncio.sleep(1)
                 last_exception = e
