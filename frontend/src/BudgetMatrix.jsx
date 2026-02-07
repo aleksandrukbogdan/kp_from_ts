@@ -67,10 +67,43 @@ export default function BudgetMatrix({
     const [showStats, setShowStats] = useState(true);
     const [editingRisk, setEditingRisk] = useState(null);
 
-    // Gantt: смещение начала каждого этапа (в неделях)
+    // Gantt: смещение начала (недели) и длительность (недели)
     const [stageOffsets, setStageOffsets] = useState({});
-    // Для подсветки при hover
+    const [stageDurations, setStageDurations] = useState({});
+
+    // Для подсветки и ресайза
     const [hoveredStage, setHoveredStage] = useState(null);
+    const [dragState, setDragState] = useState(null);
+
+    // Global mouse event listeners for drag/resize
+    React.useEffect(() => {
+        if (!dragState) return;
+
+        const handleMouseMove = (e) => {
+            const deltaX = e.clientX - dragState.startX;
+            const deltaUnits = Math.round(deltaX / 50); // 50px per week
+
+            if (dragState.type === 'move') {
+                const newOffset = Math.max(0, dragState.startVal + deltaUnits);
+                setStageOffsets(prev => ({ ...prev, [dragState.stage]: newOffset }));
+            } else if (dragState.type === 'resize') {
+                const newDuration = Math.max(1, dragState.startVal + deltaUnits);
+                setStageDurations(prev => ({ ...prev, [dragState.stage]: newDuration }));
+            }
+        };
+
+        const handleMouseUp = () => {
+            setDragState(null);
+        };
+
+        window.addEventListener('mousemove', handleMouseMove);
+        window.addEventListener('mouseup', handleMouseUp);
+
+        return () => {
+            window.removeEventListener('mousemove', handleMouseMove);
+            window.removeEventListener('mouseup', handleMouseUp);
+        };
+    }, [dragState]);
 
     // Диалоги
     const [openRoleDialog, setOpenRoleDialog] = useState(false);
@@ -175,26 +208,34 @@ export default function BudgetMatrix({
             }));
     }, [calculations.roleHours]);
 
+    // Расчет дефолтных позиций (чтобы избежать зависимости при перемещении)
+    const defaultLayout = useMemo(() => {
+        let currentOffset = 0;
+        const layout = {};
+        stages.forEach(stage => {
+            const stageRoleHours = budgetMatrix[stage] || {};
+            const maxRoleHours = Math.max(...Object.values(stageRoleHours), 0);
+            const duration = Math.max(1, Math.ceil(maxRoleHours / HOURS_PER_WEEK));
+            layout[stage] = { start: currentOffset, duration };
+            currentOffset += duration;
+        });
+        return layout;
+    }, [stages, budgetMatrix]);
+
     const ganttData = useMemo(() => {
-        let cumulativeOffset = 0;
         return stages.map((stage, idx) => {
+            const defaults = defaultLayout[stage] || { start: 0, duration: 1 };
             const stageRoleHours = budgetMatrix[stage] || {};
             const totalHours = calculations.stageHours[stage] || 0;
 
-            // Option C: Рассчитываем длительность на основе параллельности ролей
-            // Ищем максимальные часы среди всех ролей на этапе
-            const maxRoleHours = Math.max(...Object.values(stageRoleHours), 0);
-            // Длительность = макс. часы / часов в неделю (округляем вверх, минимум 1)
-            const duration = Math.max(1, Math.ceil(maxRoleHours / HOURS_PER_WEEK));
-
-            // Используем сохранённое смещение или кумулятивное
-            const startOffset = stageOffsets[stage] ?? cumulativeOffset;
-            cumulativeOffset = startOffset + duration;
+            // Используем ручные значения или дефолтные
+            const duration = stageDurations[stage] ?? defaults.duration;
+            const startOffset = stageOffsets[stage] ?? defaults.start;
 
             return {
                 name: stage,
                 hours: totalHours,
-                maxRoleHours,
+                defaults,
                 duration,
                 startOffset,
                 endOffset: startOffset + duration,
@@ -202,7 +243,7 @@ export default function BudgetMatrix({
                 fill: '#78909C', // Neutral blue-grey
             };
         });
-    }, [stages, budgetMatrix, calculations.stageHours, stageOffsets, riskCoefficients]);
+    }, [stages, budgetMatrix, calculations.stageHours, stageOffsets, stageDurations, defaultLayout, riskCoefficients]);
 
     // Максимальная длина шкалы (для X-axis)
     const maxWeeks = useMemo(() => {
@@ -214,6 +255,14 @@ export default function BudgetMatrix({
         setStageOffsets(prev => ({
             ...prev,
             [stageName]: Math.max(0, Math.round(newOffset))
+        }));
+    }, []);
+
+    // Обработчик изменения длительности
+    const handleStageDurationChange = useCallback((stageName, newDuration) => {
+        setStageDurations(prev => ({
+            ...prev,
+            [stageName]: Math.max(1, Math.round(newDuration))
         }));
     }, []);
 
@@ -304,7 +353,7 @@ export default function BudgetMatrix({
                         p: 3,
                         mb: 3,
                         bgcolor: 'background.paper',
-                        borderRadius: 6, // 24px Material 3
+                        borderRadius: 4, // 16px Material 3 (Standard)
                         border: '1px solid',
                         borderColor: 'divider',
                         boxShadow: '0 1px 3px rgba(0,0,0,0.08)',
@@ -313,10 +362,16 @@ export default function BudgetMatrix({
                     <Box display="flex" alignItems="center" gap={1} mb={3}>
                         <Timeline sx={{ color: '#FF6B00' }} />
                         <Typography variant="subtitle1" fontWeight={600}>
-                            Диаграмма Ганта (Недели)
+                            Диаграмма Ганта
                         </Typography>
+                        <Chip
+                            label="1 неделя = 40 часов"
+                            size="small"
+                            variant="outlined"
+                            sx={{ ml: 1, borderColor: 'divider', fontSize: '0.7rem', height: 20 }}
+                        />
                         <Typography variant="caption" color="text.secondary" sx={{ ml: 'auto' }}>
-                            Перетащите бары для изменения расписания
+                            Перетаскивайте бары и изменяйте их размер (тяните за правый край)
                         </Typography>
                     </Box>
 
@@ -385,41 +440,36 @@ export default function BudgetMatrix({
                                     </Typography>
                                 </Box>
 
-                                {/* Бар (с drag) */}
+                                {/* Бар (с drag и resize) */}
                                 <Box
+                                    onMouseDown={(e) => {
+                                        // Если клик по resize handle, не начинаем drag
+                                        if (e.target.dataset.type === 'resize') return;
+                                        setDragState({
+                                            type: 'move',
+                                            stage: item.name,
+                                            startX: e.clientX,
+                                            startVal: item.startOffset
+                                        });
+                                    }}
                                     sx={{
                                         ml: `${item.startOffset * 50}px`,
                                         width: `${Math.max(item.duration * 50 - 4, 20)}px`,
                                         height: 28,
                                         bgcolor: hoveredStage === item.name ? '#FF6B00' : item.fill,
                                         borderRadius: '4px 8px 8px 4px',
-                                        cursor: 'grab',
-                                        transition: 'background-color 0.2s, transform 0.1s, box-shadow 0.2s',
+                                        cursor: dragState?.stage === item.name && dragState.type === 'move' ? 'grabbing' : 'grab',
+                                        transition: dragState?.stage === item.name ? 'none' : 'background-color 0.2s, transform 0.1s, box-shadow 0.2s',
                                         display: 'flex',
                                         alignItems: 'center',
                                         justifyContent: 'center',
+                                        position: 'relative',
                                         boxShadow: hoveredStage === item.name ? '0 2px 8px rgba(255, 107, 0, 0.3)' : 'none',
                                         '&:hover': {
-                                            transform: 'scaleY(1.08)'
+                                            transform: dragState?.stage === item.name ? 'none' : 'scaleY(1.08)',
+                                            zIndex: 1
                                         },
                                         '&:active': { cursor: 'grabbing' }
-                                    }}
-                                    draggable
-                                    onDragStart={(e) => {
-                                        e.dataTransfer.setData('stageName', item.name);
-                                        e.dataTransfer.setData('startOffset', String(item.startOffset));
-                                        e.dataTransfer.effectAllowed = 'move';
-                                    }}
-                                    onDragEnd={(e) => {
-                                        // Рассчитываем новое смещение на основе позиции
-                                        const dropX = e.clientX;
-                                        const container = e.target.closest('.MuiBox-root')?.parentElement;
-                                        if (container) {
-                                            const rect = container.getBoundingClientRect();
-                                            const relativeX = dropX - rect.left - 200; // 200px = ширина лейблов
-                                            const newOffset = Math.round(relativeX / 50);
-                                            handleStageOffsetChange(item.name, newOffset);
-                                        }
                                     }}
                                 >
                                     {item.duration > 1 && (
@@ -429,12 +479,45 @@ export default function BudgetMatrix({
                                                 color: 'white',
                                                 fontWeight: 600,
                                                 fontSize: '0.65rem',
-                                                textShadow: '0 1px 2px rgba(0,0,0,0.3)'
+                                                textShadow: '0 1px 2px rgba(0,0,0,0.3)',
+                                                pointerEvents: 'none',
+                                                userSelect: 'none'
                                             }}
                                         >
                                             {item.duration}н
                                         </Typography>
                                     )}
+
+                                    {/* Resize Handle */}
+                                    <Box
+                                        data-type="resize"
+                                        onMouseDown={(e) => {
+                                            e.stopPropagation();
+                                            setDragState({
+                                                type: 'resize',
+                                                stage: item.name,
+                                                startX: e.clientX,
+                                                startVal: item.duration
+                                            });
+                                        }}
+                                        sx={{
+                                            position: 'absolute',
+                                            right: 0,
+                                            top: 0,
+                                            bottom: 0,
+                                            width: 12,
+                                            cursor: 'ew-resize',
+                                            bgcolor: 'transparent',
+                                            display: 'flex',
+                                            alignItems: 'center',
+                                            justifyContent: 'center',
+                                            '&:hover': {
+                                                bgcolor: 'rgba(255,255,255,0.3)'
+                                            }
+                                        }}
+                                    >
+                                        <Box sx={{ width: 2, height: 12, bgcolor: 'rgba(255,255,255,0.5)', borderRadius: 1 }} />
+                                    </Box>
                                 </Box>
                             </Box>
                         ))}
@@ -443,7 +526,7 @@ export default function BudgetMatrix({
             </Collapse>
 
             {/* Main Table */}
-            <TableContainer sx={{ borderRadius: 2, border: '1px solid', borderColor: 'divider', mb: 2 }}>
+            <TableContainer sx={{ borderRadius: 4, border: '1px solid', borderColor: 'divider', mb: 2 }}>
                 <Table size="small">
                     <TableHead>
                         <TableRow sx={{ bgcolor: 'grey.50' }}>
@@ -634,7 +717,7 @@ export default function BudgetMatrix({
                             flex: 1,
                             minWidth: 320,
                             bgcolor: 'background.paper',
-                            borderRadius: 6, // 24px Material 3
+                            borderRadius: 4, // 16px Material 3
                             border: '1px solid',
                             borderColor: 'divider',
                             boxShadow: '0 1px 3px rgba(0,0,0,0.08)',
@@ -729,7 +812,7 @@ export default function BudgetMatrix({
                             flex: 1,
                             minWidth: 280,
                             background: 'linear-gradient(135deg, #FFF8F0 0%, #FFF0E0 100%)',
-                            borderRadius: 6, // 24px Material 3
+                            borderRadius: 4, // 16px Material 3
                             border: '1px solid',
                             borderColor: 'rgba(255, 152, 0, 0.2)',
                             boxShadow: '0 2px 8px rgba(255, 152, 0, 0.1)',
