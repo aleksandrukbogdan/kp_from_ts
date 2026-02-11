@@ -5,6 +5,9 @@ services:
   frontend:
     image: node:20-alpine
     container_name: react_frontend
+    labels:
+      app: "kp-frontend"
+      service: "frontend"
     working_dir: /app
     volumes:
       - ./frontend:/app
@@ -21,18 +24,46 @@ services:
     networks:
       - ai_platform_network
 
+  # 2.5 GPU Monitoring (NVIDIA DCGM Exporter)
+  dcgm-exporter:
+    image: nvidia/dcgm-exporter:3.3.5-3.4.1-ubuntu22.04
+    container_name: monitoring-dcgm-exporter
+    restart: unless-stopped
+    environment:
+      - DCGM_EXPORTER_NO_HOSTNAME=1
+    cap_add:
+      - SYS_ADMIN
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [ gpu ]
+    ports:
+      - "9400:9400"
+    networks:
+      - monitoring_network
+
   # 2. Backend (FastAPI)
   api:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: fastapi_backend
+    labels:
+      app: "kp-api"
+      service: "backend"
     command: uvicorn api:app --host 0.0.0.0 --port 8000
     # Порт 8000 внутри сети (доступен для Frontend через http://api:8000)
     # Если нужно тестировать API снаружи, можно раскомментировать:
     # ports:
     #   - "8000:8000" 
     env_file: .env
+    environment:
+      - KEYCLOAK_URL=http://10.109.50.250:5058
+      - KEYCLOAK_REALM=platform
+      - KEYCLOAK_CLIENT_ID=agent-kp
     depends_on:
       - temporal-server
     networks:
@@ -47,6 +78,9 @@ services:
   ai-worker-kp:
     build: .
     container_name: agent_kp_worker
+    labels:
+      app: "kp-worker"
+      service: "worker"
     command: python worker.py
     env_file: .env
     environment:

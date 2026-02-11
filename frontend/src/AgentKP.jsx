@@ -16,18 +16,11 @@ import { useNavigate, useSearchParams } from 'react-router-dom';
 import { config } from './config';
 import MarkdownEditor from './MarkdownEditor';
 import BudgetMatrix from './BudgetMatrix';
+import keycloak from './keycloak';
 
 // Адрес FastAPI бэкенда (автоматически dev/prod)
 const API_URL = config.API_URL;
-axios.defaults.withCredentials = true;
-
-// Функция для получения имени пользователя из cookie
-function getCookie(name) {
-  const value = `; ${document.cookie}`;
-  const parts = value.split(`; ${name}=`);
-  if (parts.length === 2) return decodeURIComponent(parts.pop().split(';').shift());
-  return null;
-}
+// Note: axios Bearer token is set globally by App.jsx keycloak interceptor
 
 // Helper to format data (arrays) to multiline string
 const formatDataToString = (val) => {
@@ -108,14 +101,10 @@ export default function AgentKP() {
   };
 
   useEffect(() => {
-    const user = getCookie('portal_user');
-    if (user) {
-      setUsername(user);
-    } else {
-      // Если пользователь не авторизован - перенаправляем на логин
-      navigate('/login');
-    }
-  }, [navigate]);
+    // Get username from Keycloak token
+    const user = keycloak.tokenParsed?.preferred_username || keycloak.tokenParsed?.sub || '';
+    setUsername(user);
+  }, []);
 
   // Check for workflow_id in URL params (for resuming sessions)
   const [searchParams] = useSearchParams();
@@ -380,9 +369,7 @@ export default function AgentKP() {
   };
 
   const handleLogout = () => {
-    document.cookie = 'portal_auth_token=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;';
-    document.cookie = 'portal_user=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;';
-    window.location.href = '/login';
+    keycloak.logout({ redirectUri: window.location.origin });
   };
 
   // --- 1. ЗАГРУЗКА ФАЙЛА ---

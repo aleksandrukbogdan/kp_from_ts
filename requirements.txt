@@ -15,3 +15,8 @@ sqlalchemy>=2.0
 
 # Monitoring
 prometheus-fastapi-instrumentator==7.0.0
+python-json-logger
+
+# Keycloak auth
+python-jose[cryptography]
+httpx

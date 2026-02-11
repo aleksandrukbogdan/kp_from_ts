@@ -1,12 +1,15 @@
 // src/App.jsx
-import React from 'react';
+import React, { useState, useEffect } from 'react';
 import { BrowserRouter, Routes, Route } from 'react-router-dom';
-import { CssBaseline, ThemeProvider, createTheme } from '@mui/material';
+import { CssBaseline, ThemeProvider, createTheme, Box, CircularProgress, Typography } from '@mui/material';
+import axios from 'axios';
+
+// Keycloak
+import keycloak from './keycloak';
 
 // Импортируем страницы
 import Portal from './Portal';
 import AgentKP from './AgentKP';
-import Login from './Login';
 
 // Material 3 Theme с оранжевой палитрой
 const theme = createTheme({
@@ -192,7 +195,130 @@ const theme = createTheme({
   },
 });
 
+let keycloakInitialized = false; // Guard against React StrictMode double-init
+
 function App() {
+  const [keycloakReady, setKeycloakReady] = useState(false);
+  const [initError, setInitError] = useState(null);
+
+  useEffect(() => {
+    if (keycloakInitialized) return;
+    keycloakInitialized = true;
+
+    keycloak.init({
+      onLoad: 'login-required',  // Redirect to Keycloak login if not authenticated
+      checkLoginIframe: false,   // Disable iframe check (avoids CORS issues with HTTP)
+      // Note: PKCE (S256) requires HTTPS. Since we run on HTTP, we omit it.
+    })
+      .then((authenticated) => {
+        if (authenticated) {
+          console.log('Keycloak authenticated as:', keycloak.tokenParsed?.preferred_username);
+
+          // Set up axios interceptor to add Bearer token to all requests
+          axios.interceptors.request.use(
+            async (config) => {
+              // Refresh token if it expires within 30 seconds
+              try {
+                await keycloak.updateToken(30);
+              } catch (err) {
+                console.error('Token refresh failed, redirecting to login');
+                keycloak.login();
+                return Promise.reject(err);
+              }
+              config.headers.Authorization = `Bearer ${keycloak.token}`;
+              return config;
+            },
+            (error) => Promise.reject(error)
+          );
+
+          // Handle 401 responses — redirect to Keycloak login
+          axios.interceptors.response.use(
+            (response) => response,
+            (error) => {
+              if (error.response?.status === 401) {
+                keycloak.login();
+              }
+              return Promise.reject(error);
+            }
+          );
+
+          // Auto-refresh token periodically (every 60 seconds)
+          setInterval(() => {
+            keycloak.updateToken(70).catch(() => {
+              console.warn('Token refresh failed');
+            });
+          }, 60000);
+
+          setKeycloakReady(true);
+        } else {
+          // Not authenticated — Keycloak will redirect automatically
+          console.log('Not authenticated, Keycloak will redirect...');
+        }
+      })
+      .catch((err) => {
+        console.error('Keycloak init failed:', err);
+        setInitError('Не удалось подключиться к серверу авторизации. Проверьте доступность Keycloak.');
+      });
+  }, []);
+
+  // Loading screen while Keycloak initializes
+  if (initError) {
+    return (
+      <ThemeProvider theme={theme}>
+        <CssBaseline />
+        <Box
+          sx={{
+            minHeight: '100vh',
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            justifyContent: 'center',
+            bgcolor: 'background.default',
+            gap: 2,
+            px: 3,
+          }}
+        >
+          <Typography variant="h5" color="error" textAlign="center">
+            Ошибка авторизации
+          </Typography>
+          <Typography variant="body1" color="text.secondary" textAlign="center">
+            {initError}
+          </Typography>
+        </Box>
+      </ThemeProvider>
+    );
+  }
+
+  if (!keycloakReady) {
+    return (
+      <ThemeProvider theme={theme}>
+        <CssBaseline />
+        <Box
+          sx={{
+            minHeight: '100vh',
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            justifyContent: 'center',
+            bgcolor: 'background.default',
+            gap: 2,
+          }}
+        >
+          <Box
+            component="img"
+            src="/logo.svg"
+            alt="НИР-центр"
+            sx={{ height: 48, mb: 2 }}
+          />
+          <CircularProgress color="primary" />
+          <Typography variant="body2" color="text.secondary">
+            Авторизация...
+          </Typography>
+        </Box>
+      </ThemeProvider>
+    );
+  }
+
   return (
     <ThemeProvider theme={theme}>
       <CssBaseline />
@@ -200,14 +326,14 @@ function App() {
       {/* Обертка Роутера */}
       <BrowserRouter>
         <Routes>
-          {/* Страница авторизации */}
-          <Route path="/login" element={<Login />} />
-
           {/* Главная страница -> Портал */}
           <Route path="/" element={<Portal />} />
 
           {/* Страница приложения -> Агент КП (с встроенной историей) */}
           <Route path="/agent-kp" element={<AgentKP />} />
+
+          {/* Catch-all: redirect to portal */}
+          <Route path="*" element={<Portal />} />
         </Routes>
       </BrowserRouter>
 

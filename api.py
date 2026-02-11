@@ -10,7 +10,7 @@ from temporalio.client import Client
 
 # Импорт твоих workflow
 from workflows import ProposalWorkflow
-from users import validate_user
+from keycloak_auth import verify_keycloak_token
 from database import (
     save_user_file, 
     update_file_status,
@@ -26,7 +26,98 @@ import uuid
 SHARED_DIR = "/shared_data"
 os.makedirs(SHARED_DIR, exist_ok=True)
 
+
 app = FastAPI(title="Agent KP API")
+
+# Ensure JSONResponse is available for exception handler
+from fastapi.responses import JSONResponse
+
+
+# --- Logging Setup (JSON) ---
+import logging
+import time
+import uuid
+from pythonjsonlogger import jsonlogger
+from starlette.middleware.base import BaseHTTPMiddleware
+
+logger = logging.getLogger("kp-api")
+logHandler = logging.StreamHandler()
+# Use 'timestamp' instead of 'asctime' for easier parsing in modern stacks
+formatter = jsonlogger.JsonFormatter(
+    fmt='%(timestamp)s %(levelname)s %(name)s %(user)s %(action)s %(request_id)s %(message)s',
+    datefmt='%Y-%m-%dT%H:%M:%SZ',
+    rename_fields={'asctime': 'timestamp'} # Rename built-in field
+)
+logHandler.setFormatter(formatter)
+logger.addHandler(logHandler)
+logger.setLevel(logging.INFO)
+
+# Middleware for Request ID and Logging timing
+class RequestContextMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
+        request.state.request_id = request_id # Store for endpoints
+        start_time = time.time()
+        
+        try:
+            response = await call_next(request)
+            
+            process_time = time.time() - start_time
+            response.headers["X-Request-ID"] = request_id
+            
+            # Log request completion with appropriate level based on status code
+            log_params = {
+                "request_id": request_id,
+                "method": request.method,
+                "path": request.url.path,
+                "status_code": response.status_code,
+                "duration": f"{process_time:.4f}s",
+                "user": "unknown", # Middleware runs before auth, so user is unknown here unless parsed
+                "action": "REQUEST"
+            }
+            
+            # Optional: Log success (INFO) or keep silent to reduce noise
+            # Silence specific polling endpoints to avoid spam
+            SILENT_PATHS = ["/api/history", "/api/status", "/metrics"]
+            is_silent = any(request.url.path.startswith(p) for p in SILENT_PATHS)
+
+            if response.status_code >= 500:
+                logger.error(f"Request failed: {response.status_code}", extra=log_params)
+            elif response.status_code >= 400:
+                logger.warning(f"Request error: {response.status_code}", extra=log_params)
+            elif not is_silent:
+                # Log success only if not a silent path
+                logger.info(f"Request completed: {response.status_code}", extra=log_params)
+                
+            return response
+            
+        except Exception as e:
+            # Re-raise exception after logging it (global exception handler will prefer its own logging)
+            # But let's log a basic error here in case global handler misses something
+            logger.error(f"Request exception: {str(e)}", extra={
+                "request_id": request_id,
+                "path": request.url.path,
+                "user": "unknown",
+                "action": "CRASH"
+            })
+            raise e
+
+app.add_middleware(RequestContextMiddleware)
+
+# Global Exception Handler
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    # Include stack trace in logs with exc_info=True
+    logger.error(f"Unhandled exception: {str(exc)}", exc_info=True, extra={
+        "request_id": getattr(request.state, "request_id", "unknown"),
+        "path": request.url.path,
+        "user": "unknown"
+    })
+    from fastapi.responses import JSONResponse
+    return JSONResponse(
+        status_code=500,
+        content={"message": "Internal Server Error", "request_id": getattr(request.state, "request_id", "unknown")},
+    )
 
 # Prometheus metrics for monitoring
 from prometheus_fastapi_instrumentator import Instrumentator
@@ -36,33 +127,51 @@ Instrumentator().instrument(app).expose(app)
 IS_DEV = os.getenv('IS_DEV', 'false').lower() == 'true'
 SERVER_ADDRESS = 'localhost' if IS_DEV else '10.109.50.250'
 
-# CORS: Разрешаем React обращаться к API
+# Keycloak URL for CORS
+KEYCLOAK_URL = os.getenv('KEYCLOAK_URL', 'http://10.109.50.250:5058')
+
+# CORS: Разрешаем React и Keycloak обращаться к API
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         f"http://{SERVER_ADDRESS}:5173",
+        f"http://{SERVER_ADDRESS}:8090",
         "http://localhost:5173",  # Всегда разрешаем localhost для удобства отладки
+        KEYCLOAK_URL,
     ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Request-ID"] # Expose Request-ID to frontend
 )
 
 # --- Зависимости ---
 
-async def get_temporal_client():
-    return await Client.connect("temporal-server:7233")
+_temporal_client_instance = None
 
-async def verify_auth(request: Request):
-    """
-    Проверяет наличие куки авторизации от portal_app.py.
-    В продакшене здесь стоит добавить валидацию токена через Redis или БД.
-    """
-    token = request.cookies.get("portal_auth_token")
-    user = request.cookies.get("portal_user")
-    if not token or not user:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    return user
+@app.on_event("startup")
+async def startup_event():
+    global _temporal_client_instance
+    try:
+        # P.S. Temporal client is thread-safe and should be reused
+        _temporal_client_instance = await Client.connect("temporal-server:7233")
+        logger.info("Connected to Temporal server")
+    except Exception as e:
+        logger.error(f"Failed to connect to Temporal server on startup: {e}", exc_info=True)
+
+async def get_temporal_client():
+    global _temporal_client_instance
+    if _temporal_client_instance is None:
+        try:
+            logger.info("Reconnecting to Temporal server...")
+            _temporal_client_instance = await Client.connect("temporal-server:7233")
+        except Exception as e:
+            logger.error(f"Failed to lazy-connect to Temporal: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail="Temporal service unavailable")
+    return _temporal_client_instance
+
+# Auth dependency — делегируем в keycloak_auth.py
+verify_auth = verify_keycloak_token
 
 # --- Модели данных (Pydantic) ---
 
@@ -71,34 +180,20 @@ class ApprovalRequest(BaseModel):
     budget: Dict[str, Dict[str, float]] # Структура {Stage: {Role: hours}}
     rates: Dict[str, float]
 
-class LoginRequest(BaseModel):
-    username: str
-    password: str
-
 # --- Endpoints ---
 
 class DownloadRequest(BaseModel):
     text: str
 
-@app.post("/api/login")
-async def login(request: LoginRequest):
-    """Аутентификация пользователя"""
-    if validate_user(request.username, request.password):
-        # Генерируем простой токен (в продакшене используй JWT)
-        import hashlib
-        import time
-        token = hashlib.sha256(f"{request.username}{time.time()}".encode()).hexdigest()[:32]
-        return {"success": True, "token": token}
-    else:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-
 @app.post("/api/start")
 async def start_workflow(
     file: UploadFile = File(...),
     convert_to_pdf_for_pages: bool = Form(default=True),  # Convert DOCX→PDF for page numbers
-    user: str = Depends(verify_auth)
+    user: str = Depends(verify_auth),
+    request: Request = None
 ):
     client = await get_temporal_client()
+    req_id = getattr(request.state, "request_id", "unknown") if request else "unknown"
     
     # Genererate ID and Path
     unique_id = str(uuid.uuid4())
@@ -128,6 +223,13 @@ async def start_workflow(
             workflow_id=handle.id,
             original_filename=file.filename
         )
+        
+        logger.info(f"Started workflow for file: {file.filename}", extra={
+            "user": user, 
+            "action": "UPLOAD",
+            "request_id": req_id,
+            "details": {"filename": file.filename, "workflow_id": wf_id}
+        })
         
         return {"workflow_id": handle.id}
     except Exception as e:
@@ -268,9 +370,11 @@ async def get_status(workflow_id: str, user: str = Depends(verify_auth)):
 async def approve_workflow(
     workflow_id: str, 
     payload: ApprovalRequest,
-    user: str = Depends(verify_auth)
+    user: str = Depends(verify_auth),
+    request: Request = None
 ):
     client = await get_temporal_client()
+    req_id = getattr(request.state, "request_id", "unknown") if request else "unknown"
     handle = client.get_workflow_handle(workflow_id)
     
     # Формируем структуру сигнала, которую ждет workflows.py
@@ -282,6 +386,12 @@ async def approve_workflow(
     
     try:
         await handle.signal(ProposalWorkflow.user_approve_signal, signal_data)
+        logger.info(f"User approved proposal {workflow_id}", extra={
+            "user": user,
+            "action": "APPROVE",
+            "request_id": req_id,
+            "details": {"workflow_id": workflow_id}
+        })
         return {"status": "Signal sent"}
     except Exception as e:
         error_msg = str(e).lower()
@@ -294,7 +404,13 @@ async def approve_workflow(
         raise HTTPException(status_code=500, detail=f"Failed to send signal: {e}")
 
 @app.post("/api/download_docx")
-async def download_docx(request: DownloadRequest, user: str = Depends(verify_auth)):
+async def download_docx(request: DownloadRequest, req: Request, user: str = Depends(verify_auth)):
+    req_id = getattr(req.state, "request_id", "unknown")
+    logger.info("User downloaded DOCX", extra={
+        "user": user, 
+        "action": "DOWNLOAD",
+        "request_id": req_id
+    })
     buffer = markdown_to_docx(request.text)
     return StreamingResponse(
         buffer,

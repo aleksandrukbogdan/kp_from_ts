@@ -8,14 +8,7 @@ import {
 import { Description, Chat, Mic, VisibilityOff, CompareArrows, Logout, Person } from '@mui/icons-material';
 import { useNavigate } from 'react-router-dom';
 import { config } from './config';
-
-// Функция для получения имени пользователя из cookie
-function getCookie(name) {
-    const value = `; ${document.cookie}`;
-    const parts = value.split(`; ${name}=`);
-    if (parts.length === 2) return decodeURIComponent(parts.pop().split(';').shift());
-    return null;
-}
+import keycloak from './keycloak';
 
 export default function Portal() {
     const navigate = useNavigate();
@@ -23,14 +16,10 @@ export default function Portal() {
     const [anchorEl, setAnchorEl] = useState(null);
 
     useEffect(() => {
-        const user = getCookie('portal_user');
-        if (user) {
-            setUsername(user);
-        } else {
-            // Если пользователь не авторизован - перенаправляем на логин
-            navigate('/login');
-        }
-    }, [navigate]);
+        // Get username from Keycloak token
+        const user = keycloak.tokenParsed?.preferred_username || keycloak.tokenParsed?.sub || '';
+        setUsername(user);
+    }, []);
 
     const handleMenuOpen = (event) => {
         setAnchorEl(event.currentTarget);
@@ -41,10 +30,7 @@ export default function Portal() {
     };
 
     const handleLogout = () => {
-        // Очищаем куки и перенаправляем на страницу логина
-        document.cookie = 'portal_auth_token=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;';
-        document.cookie = 'portal_user=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;';
-        navigate('/login');
+        keycloak.logout({ redirectUri: window.location.origin });
     };
 
     const apps = [

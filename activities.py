@@ -352,11 +352,23 @@ async def estimate_hours_activity(tz_data: dict, stages: list, roles: list) -> d
 4. Если этап уникален — оценивай по аналогии с похожими.
 5. Отвечай на РУССКОМ."""
 
+        # Optimization: Extract only text, stripping large RAG quotes
+        p_essence = tz_data.get('project_essence')
+        p_essence_txt = p_essence.get('text', str(p_essence)) if isinstance(p_essence, dict) else str(p_essence)
+
+        t_stack = tz_data.get('tech_stack', [])
+        t_stack_txt = []
+        if isinstance(t_stack, list):
+            for item in t_stack:
+                val = item.get('text', str(item)) if isinstance(item, dict) else str(item)
+                t_stack_txt.append(val)
+        t_stack_str = ", ".join(t_stack_txt)
+
         user_prompt = f"""{reference_context}
 
 ТЕКУЩИЙ ПРОЕКТ:
-Суть: {tz_data.get('project_essence', 'N/A')}
-Стек: {tz_data.get('tech_stack', [])}
+Суть: {p_essence_txt}
+Стек: {t_stack_str}
 
 Этапы (stages): {stages}
 Роли (roles): {roles}
@@ -423,14 +435,39 @@ async def generate_proposal_activity(data: dict, budget_matrix: dict, rates: dic
     detailed_budget_text += f"\n**Total Estimated Cost: {total_sum} RUB**"
 
     try:
+        # Optimization: Prepare prompt data by stripping large source quotes (without mutating original)
+        def _get_text(val):
+            if isinstance(val, dict):
+                return val.get('text', str(val))
+            return str(val)
+            
+        def _get_list_text(val_list):
+            if isinstance(val_list, list):
+                return ", ".join([_get_text(v) for v in val_list])
+            return str(val_list)
+
+        p_essence = _get_text(data.get('project_essence', ''))
+        b_goals = _get_list_text(data.get('business_goals', []))
+        t_stack = _get_list_text(data.get('tech_stack', []))
+        
+        # Format Key Features (Complex nested structure)
+        k_features = data.get('key_features', {})
+        k_features_txt = ""
+        if isinstance(k_features, dict):
+            for category, items in k_features.items():
+                if items:
+                     k_features_txt += f"\n- {category}: {_get_list_text(items)}"
+        else:
+             k_features_txt = str(k_features)
+
         proposal: ProposalResult = await llm.create_structured_completion(
             messages=[
                 {"role": "system", "content": "Ты Менеджер по продажам. Напиши убедительное Коммерческое Предложение в формате Markdown на РУССКОМ языке."},
                 {"role": "user", "content": f"""
-Суть проекта: {data.get('project_essence')}
-Цели: {data.get('business_goals')}
-Функционал: {data.get('key_features')}
-Стек: {data.get('tech_stack')}
+Суть проекта: {p_essence}
+Цели: {b_goals}
+Функционал: {k_features_txt}
+Стек: {t_stack}
 
 Бюджет (включи эту таблицу в КП):
 {detailed_budget_text}

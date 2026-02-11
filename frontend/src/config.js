@@ -12,11 +12,16 @@ export const config = {
     // Используем относительный путь, чтобы запросы шли через Vite Proxy (на порт 8090 -> 5173 -> api:8000)
     API_URL: '/api',
 
+    // Keycloak
+    KEYCLOAK_URL: 'http://10.109.50.250:5058',
+    KEYCLOAK_REALM: 'platform',
+    KEYCLOAK_CLIENT_ID: 'agent-kp',
+
     // Внешние сервисы
     RAG_BOT_URL: `http://10.109.50.250:5111`,
     VKS_SUMMARY_URL: `http://10.109.50.250:5000`,
     ANONYMIZER_URL: `http://10.109.50.250:5053`,
-    DOC_COMPARE_URL: `http://10.109.50.250:5055`,
+    DOC_COMPARE_URL: `https://compare.nir.center/`,
 };
 
 export default config;
