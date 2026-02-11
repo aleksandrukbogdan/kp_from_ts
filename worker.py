@@ -13,7 +13,8 @@ from activities import (
     analyze_project_activity,
     analyze_requirements_chunk_activity, # New
     refine_requirements_activity, # New
-    enrich_with_rag_activity # RAG enrichment
+    enrich_with_rag_activity, # RAG enrichment
+    classify_manager_notes_activity # Manager notes classification
 )
 from workflows import ProposalWorkflow
 
@@ -45,7 +46,8 @@ async def main():
             analyze_project_activity,
             analyze_requirements_chunk_activity, # New (LLM)
             refine_requirements_activity, # New (Embeddings/Search)
-            enrich_with_rag_activity # RAG enrichment
+            enrich_with_rag_activity, # RAG enrichment
+            classify_manager_notes_activity # Manager notes
         ]
     )
     print("Workers started")

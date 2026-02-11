@@ -189,6 +189,7 @@ class DownloadRequest(BaseModel):
 async def start_workflow(
     file: UploadFile = File(...),
     convert_to_pdf_for_pages: bool = Form(default=True),  # Convert DOCX→PDF for page numbers
+    additional_notes: str = Form(default=""),  # Free-text user notes/requirements
     user: str = Depends(verify_auth),
     request: Request = None
 ):
@@ -212,7 +213,7 @@ async def start_workflow(
     try:
         handle = await client.start_workflow(
             ProposalWorkflow.run,
-            args=[file_path, file.filename, convert_to_pdf_for_pages],  # Pass conversion flag
+            args=[file_path, file.filename, convert_to_pdf_for_pages, additional_notes],  # Pass conversion flag + user notes
             id=wf_id,
             task_queue="proposal-queue", # Важно: совпадает с worker.py
         )

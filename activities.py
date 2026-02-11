@@ -27,7 +27,8 @@ from schemas import (
     KeyFeaturesDetails,
     SourceText,
     RequirementAnalysisResult,
-    RequirementAnalysisItem
+    RequirementAnalysisItem,
+    ManagerNotesResult
 )
 from utils_text import split_markdown, merge_extracted_data
 
@@ -328,7 +329,7 @@ def _format_reference_for_prompt(reference: dict, max_projects: int = 3) -> str:
     return "\n".join(lines)
 
 @activity.defn
-async def estimate_hours_activity(tz_data: dict, stages: list, roles: list) -> dict:
+async def estimate_hours_activity(tz_data: dict, stages: list, roles: list, additional_notes: str = "") -> dict:
     """
     Generates Budget Matrix: Stage -> Role -> Hours
     Uses reference_data.json as context for more accurate estimates.
@@ -369,6 +370,9 @@ async def estimate_hours_activity(tz_data: dict, stages: list, roles: list) -> d
 ТЕКУЩИЙ ПРОЕКТ:
 Суть: {p_essence_txt}
 Стек: {t_stack_str}
+{f'''
+Дополнительные указания заказчика:
+{additional_notes}''' if additional_notes else ''}
 
 Этапы (stages): {stages}
 Роли (roles): {roles}
@@ -416,7 +420,7 @@ async def estimate_hours_activity(tz_data: dict, stages: list, roles: list) -> d
         return {stage: {role: 0 for role in roles} for stage in stages}
 
 @activity.defn
-async def generate_proposal_activity(data: dict, budget_matrix: dict, rates: dict) -> str:
+async def generate_proposal_activity(data: dict, budget_matrix: dict, rates: dict, additional_notes: str = "") -> str:
     """Generates Commercial Proposal Markdown"""
     llm = LLMService()
     
@@ -468,6 +472,9 @@ async def generate_proposal_activity(data: dict, budget_matrix: dict, rates: dic
 Цели: {b_goals}
 Функционал: {k_features_txt}
 Стек: {t_stack}
+{f'''
+Дополнительные указания заказчика (учти в КП):
+{additional_notes}''' if additional_notes else ''}
 
 Бюджет (включи эту таблицу в КП):
 {detailed_budget_text}
@@ -701,6 +708,10 @@ async def enrich_with_rag_activity(merged_data: dict) -> dict:
         if not item or not isinstance(item, dict):
             return item
         
+        # Skip items already tagged as manager requirements
+        if item.get('source_quote') == 'Требование менеджера' or item.get('source') == 'Требование менеджера':
+            return item
+        
         query = item.get('text', '')
         if not query or len(query) < 5:  # Skip very short queries
             return item
@@ -746,6 +757,86 @@ async def enrich_with_rag_activity(merged_data: dict) -> dict:
     
     activity.logger.info("RAG enrichment complete.")
     return merged_data
+
+@activity.defn
+async def classify_manager_notes_activity(additional_notes: str, merged_data: dict) -> dict:
+    """
+    Dedicated activity: classifies manager's free-text notes into structured items.
+    Uses a flat list schema (text + category enum) — simple for LLM.
+    Code maps categories to merged_data fields deterministically.
+    """
+    if not additional_notes or not additional_notes.strip():
+        return merged_data
+    
+    llm = LLMService()
+    MANAGER_TAG = "Требование менеджера"
+    
+    try:
+        activity.logger.info(f"Classifying manager notes ({len(additional_notes)} chars)...")
+        
+        system_prompt = """Ты Системный Аналитик. Тебе дан свободный текст с указаниями менеджера проекта.
+
+Твоя задача: разбить текст на отдельные требования и классифицировать каждое.
+
+Для каждого требования выбери ОДНУ категорию:
+- business_goal — бизнес-цель ("увеличить продажи", "выйти на новый рынок")
+- tech_stack — технология ("PostgreSQL", "React", "Docker")
+- integration — интеграция с внешней системой ("1С", "Bitrix", "SAP")
+- module — функциональный модуль или функция ("авторизация", "каталог товаров")
+- screen — экран, форма, UI-компонент ("дашборд", "форма заказа")
+- report — отчёт или аналитика ("отчёт по продажам")
+- nfr — нефункциональное требование ("время отклика < 2с", "без тестировщика")
+
+ПРАВИЛА:
+1. Одно указание = один пункт. Не дублируй.
+2. Если не уверен в категории — ставь module.
+3. Формулируй кратко и чётко.
+4. Отвечай на РУССКОМ."""
+        
+        result: ManagerNotesResult = await llm.create_structured_completion(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Указания менеджера:\n\n{additional_notes}"}
+            ],
+            output_model=ManagerNotesResult,
+            tool_name="classify_manager_notes"
+        )
+        
+        # Deterministic mapping: category → merged_data location
+        CATEGORY_MAP = {
+            "business_goal": ("business_goals", None),
+            "tech_stack":    ("tech_stack", None),
+            "integration":   ("client_integrations", None),
+            "module":        ("key_features", "modules"),
+            "screen":        ("key_features", "screens"),
+            "report":        ("key_features", "reports"),
+            "nfr":           ("key_features", "nfr"),
+        }
+        
+        for item in result.items:
+            tagged_item = {"text": item.text, "source_quote": MANAGER_TAG}
+            field, sub_field = CATEGORY_MAP.get(item.category, ("key_features", "modules"))
+            
+            if sub_field is None:
+                # Top-level list (business_goals, tech_stack, client_integrations)
+                if field not in merged_data or not isinstance(merged_data[field], list):
+                    merged_data[field] = []
+                merged_data[field].append(tagged_item)
+            else:
+                # Nested under key_features
+                if 'key_features' not in merged_data or not isinstance(merged_data['key_features'], dict):
+                    merged_data['key_features'] = {}
+                kf = merged_data['key_features']
+                if sub_field not in kf or not isinstance(kf[sub_field], list):
+                    kf[sub_field] = []
+                kf[sub_field].append(tagged_item)
+        
+        activity.logger.info(f"Manager notes: {len(result.items)} items classified and merged.")
+        return merged_data
+        
+    except Exception as e:
+        activity.logger.error(f"Manager Notes Classification Failed: {e}")
+        return merged_data  # Return unchanged on error
 
 @activity.defn
 async def extract_chunk_activity(chunk_def: Dict[str, Any]) -> dict:
@@ -871,7 +962,7 @@ async def merge_data_activity(data_list: List[dict]) -> dict:
         return ExtractedTZData(project_essence=SourceText(text=f"Merge Error: {e}")).model_dump()
 
 @activity.defn
-async def analyze_project_activity(merged_data: dict) -> dict:
+async def analyze_project_activity(merged_data: dict, additional_notes: str = "") -> dict:
     """
     Phase 2: Analysis based on aggregated data.
     Populates requirement_issues, suggested_stages, suggested_roles, and estimates.
@@ -898,6 +989,12 @@ async def analyze_project_activity(merged_data: dict) -> dict:
                 {"role": "user", "content": f"""
 Данные проекта (извлеченные из ТЗ):
 {context_json}
+{f'''
+Дополнительные указания заказчика (ОБЯЗАТЕЛЬНО учти при анализе):
+{additional_notes}
+
+ВАЖНО: Если ты добавляешь новые этапы, роли или требования на основе этих указаний (а НЕ из данных ТЗ),
+то помечай их как "Требование менеджера" в поле source.''' if additional_notes else ''}
 
 Задачи:
 1. Найди проблемные требования (неясные, противоречивые) в extracted data.

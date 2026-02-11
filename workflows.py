@@ -12,7 +12,8 @@ from activities import (
     extract_chunk_activity,
     merge_data_activity,
     enrich_with_rag_activity,
-    analyze_project_activity
+    analyze_project_activity,
+    classify_manager_notes_activity
 )
 
 @workflow.defn
@@ -29,6 +30,7 @@ class ProposalWorkflow:
         self.suggested_hours = None  # AI Suggestions
         self.suggested_stages = None  # AI Suggestions
         self.suggested_roles = None  # AI Suggestions
+        self.additional_notes = ""  # Free-text user notes
     
     @workflow.query
     def get_data(self):
@@ -40,7 +42,8 @@ class ProposalWorkflow:
             "raw_text_length": self.raw_text_length,
             "suggested_hours": self.suggested_hours,
             "suggested_stages": self.suggested_stages,
-            "suggested_roles": self.suggested_roles
+            "suggested_roles": self.suggested_roles,
+            "additional_notes": self.additional_notes
         }
     
     @workflow.signal
@@ -51,7 +54,8 @@ class ProposalWorkflow:
         self.is_approved = True
         
     @workflow.run
-    async def run(self, file_path: str, file_name: str, convert_to_pdf_for_pages: bool = True):
+    async def run(self, file_path: str, file_name: str, convert_to_pdf_for_pages: bool = True, additional_notes: str = ""):
+        self.additional_notes = additional_notes
         # 1. Parsing (CPU/Docling) - Returns Path to MD file now
         md_file_path = await workflow.execute_activity(
             parse_file_activity,
@@ -135,10 +139,19 @@ class ProposalWorkflow:
             start_to_close_timeout=timedelta(minutes=5)
         )
         
+        # 5.6 Classify & Merge Manager Notes (dedicated LLM call, runs ONCE)
+        if self.additional_notes:
+            merged_data_dict = await workflow.execute_activity(
+                classify_manager_notes_activity,
+                args=[self.additional_notes, merged_data_dict],
+                task_queue="gpu-queue",
+                start_to_close_timeout=timedelta(minutes=3)
+            )
+        
         # 6. Analysis (Phase 2 - using Aggregated Data)
         self.extracted_data = await workflow.execute_activity(
             analyze_project_activity,
-            args=[merged_data_dict],
+            args=[merged_data_dict, self.additional_notes],
             task_queue="gpu-queue",
             start_to_close_timeout=timedelta(minutes=10)
         )
@@ -156,7 +169,7 @@ class ProposalWorkflow:
         # 8. Budget Estimation Matrix
         self.suggested_hours = await workflow.execute_activity(
             estimate_hours_activity,
-            args=[self.extracted_data, self.suggested_stages, self.suggested_roles],
+            args=[self.extracted_data, self.suggested_stages, self.suggested_roles, self.additional_notes],
             task_queue="gpu-queue",
             start_to_close_timeout=timedelta(minutes=10)
         )
@@ -169,7 +182,7 @@ class ProposalWorkflow:
 
         self.final_proposal = await workflow.execute_activity(
             generate_proposal_activity,
-            args=[self.extracted_data, self.budget, self.rates],
+            args=[self.extracted_data, self.budget, self.rates, self.additional_notes],
             task_queue="gpu-queue",
             start_to_close_timeout=timedelta(minutes=10)
         )

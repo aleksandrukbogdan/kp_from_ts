@@ -9,7 +9,8 @@ import {
 } from '@mui/material';
 import {
   CloudUpload, CheckCircle, Add, Delete, Refresh, ArrowBack, Logout, Person, GetApp,
-  Warning, Error as ErrorIcon, SyncProblem, Edit, PlayArrow, Visibility, Description, Schedule
+  Warning, Error as ErrorIcon, SyncProblem, Edit, PlayArrow, Visibility, Description, Schedule,
+  PersonPin
 } from '@mui/icons-material';
 import axios from 'axios';
 import { useNavigate, useSearchParams } from 'react-router-dom';
@@ -28,9 +29,23 @@ const formatDataToString = (val) => {
   return val || '';
 };
 
+// Helper: detect items from manager's additional notes (not from ТЗ)
+const MANAGER_SOURCE_TAG = 'Требование менеджера';
+const isManagerItem = (item) => {
+  if (!item) return false;
+  return item.source_quote === MANAGER_SOURCE_TAG || item.source === MANAGER_SOURCE_TAG;
+};
+
+// Manager item style constants
+const MANAGER_COLOR = '#7B1FA2'; // Purple 700
+const MANAGER_BG = 'rgba(123, 31, 162, 0.06)';
+const MANAGER_BORDER = 'rgba(123, 31, 162, 0.3)';
+const MANAGER_BG_SELECTED = 'rgba(123, 31, 162, 0.12)';
+
 export default function AgentKP() {
   const navigate = useNavigate();
   const [file, setFile] = useState(null);
+  const [additionalNotes, setAdditionalNotes] = useState('');
   const [workflowId, setWorkflowId] = useState(null);
   const [status, setStatus] = useState(null);
   const [data, setData] = useState(null);
@@ -377,6 +392,9 @@ export default function AgentKP() {
     if (!file) return;
     const formData = new FormData();
     formData.append('file', file);
+    if (additionalNotes.trim()) {
+      formData.append('additional_notes', additionalNotes.trim());
+    }
 
     try {
       // Отправляем файл на FastAPI
@@ -826,6 +844,33 @@ export default function AgentKP() {
                     {file ? file.name : "Выбрать файл"}
                   </Button>
                 </label>
+              </Box>
+
+              {/* Дополнительные пожелания */}
+              <TextField
+                multiline
+                rows={4}
+                fullWidth
+                value={additionalNotes}
+                onChange={(e) => setAdditionalNotes(e.target.value)}
+                placeholder={`Дополнительные вводные (необязательно):\n• Обязательно добавь этап "такой-то"\n• Учти что должен быть экран "такой-то"\n• В проекте не будет аналитиков и архитектора\n• Разбей на этапы "такие-то"`}
+                variant="outlined"
+                sx={{
+                  mt: 3,
+                  maxWidth: 600,
+                  mx: 'auto',
+                  '& .MuiOutlinedInput-root': {
+                    borderRadius: 2,
+                    textAlign: 'left',
+                  },
+                  '& textarea::placeholder': {
+                    fontSize: '0.875rem',
+                    opacity: 0.7,
+                  }
+                }}
+              />
+
+              <Box sx={{ display: 'flex', justifyContent: 'center', mt: 2 }}>
                 <Button
                   variant="contained"
                   size="large"
@@ -1141,15 +1186,17 @@ export default function AgentKP() {
                           <Box display="flex" flexWrap="wrap" gap={0.5} mb={1.5} sx={{ flex: 1, alignContent: 'flex-start' }}>
                             {techStackItems.map((item, idx) => {
                               const isSelected = selectedItem?.field === 'tech_stack' && selectedItem?.text === item.text;
+                              const isManager = isManagerItem(item);
                               return (
                                 <Chip
                                   key={idx}
                                   label={item.text}
                                   size="small"
+                                  icon={isManager ? <PersonPin fontSize="small" /> : undefined}
                                   onClick={() => setSelectedItem({
                                     field: 'tech_stack',
                                     text: item.text,
-                                    source: item.source,
+                                    source: item.source_quote || item.source,
                                     page_number: item.page_number,
                                     rag_confidence: item.rag_confidence
                                   })}
@@ -1163,7 +1210,12 @@ export default function AgentKP() {
                                       whiteSpace: 'normal',
                                       overflow: 'visible'
                                     },
-                                    py: 0.5
+                                    py: 0.5,
+                                    ...(isManager && !isSelected ? {
+                                      borderColor: MANAGER_BORDER,
+                                      bgcolor: MANAGER_BG,
+                                      '& .MuiChip-icon': { color: MANAGER_COLOR }
+                                    } : {})
                                   }}
                                 />
                               );
@@ -1264,6 +1316,7 @@ export default function AgentKP() {
                           return businessGoalsItems.map((item, idx) => {
                             const issue = getIssueForItem('business_goals', item.text);
                             const isSelected = selectedItem?.field === 'business_goals' && selectedItem?.text === item.text;
+                            const isManager = isManagerItem(item);
                             return (
                               <Box
                                 key={idx}
@@ -1273,18 +1326,20 @@ export default function AgentKP() {
                                   borderRadius: 1.5,
                                   cursor: 'pointer',
                                   border: '1px solid',
-                                  borderColor: isSelected ? 'primary.main' : (issue ? (issue.type === 'impossible' ? '#D32F2F' : issue.type === 'contradictory' ? '#0288D1' : '#ED6C02') : 'divider'),
-                                  bgcolor: isSelected ? 'rgba(25, 118, 210, 0.08)' : (issue ? (issue.type === 'impossible' ? '#FFEBEE' : issue.type === 'contradictory' ? '#E3F2FD' : '#FFF8E1') : 'grey.50'),
+                                  borderColor: isSelected ? 'primary.main' : isManager ? MANAGER_BORDER : (issue ? (issue.type === 'impossible' ? '#D32F2F' : issue.type === 'contradictory' ? '#0288D1' : '#ED6C02') : 'divider'),
+                                  bgcolor: isSelected ? MANAGER_BG_SELECTED : isManager ? MANAGER_BG : (issue ? (issue.type === 'impossible' ? '#FFEBEE' : issue.type === 'contradictory' ? '#E3F2FD' : '#FFF8E1') : 'grey.50'),
                                   transition: 'all 0.2s ease',
-                                  '&:hover': { borderColor: issue ? undefined : 'primary.light', bgcolor: isSelected ? undefined : 'rgba(25, 118, 210, 0.04)' }
+                                  '&:hover': { borderColor: issue ? undefined : isManager ? MANAGER_COLOR : 'primary.light', bgcolor: isSelected ? undefined : isManager ? 'rgba(123, 31, 162, 0.08)' : 'rgba(25, 118, 210, 0.04)' }
                                 }}
                               >
                                 <Box display="flex" alignItems="center" gap={1}>
-                                  {issue && (
+                                  {isManager ? (
+                                    <PersonPin fontSize="small" sx={{ color: MANAGER_COLOR }} />
+                                  ) : issue ? (
                                     issue.type === 'impossible' ? <ErrorIcon fontSize="small" sx={{ color: '#D32F2F' }} /> :
                                       issue.type === 'contradictory' ? <SyncProblem fontSize="small" sx={{ color: '#0288D1' }} /> :
                                         <Warning fontSize="small" sx={{ color: '#ED6C02' }} />
-                                  )}
+                                  ) : null}
                                   <Typography variant="body2">{item.text}</Typography>
                                 </Box>
                               </Box>
@@ -1354,6 +1409,7 @@ export default function AgentKP() {
                               {features.map((item, idx) => {
                                 const issue = getIssueForItem('key_features', item.text);
                                 const isSelected = selectedItem?.field === 'key_features' && selectedItem?.text === item.text;
+                                const isManager = isManagerItem(item);
                                 return (
                                   <Box
                                     key={idx}
@@ -1363,20 +1419,20 @@ export default function AgentKP() {
                                       borderRadius: 1.5,
                                       cursor: 'pointer',
                                       border: '1px solid',
-                                      borderColor: isSelected ? 'primary.main' : (issue ? '#ED6C02' : 'transparent'),
-                                      bgcolor: isSelected ? 'rgba(25, 118, 210, 0.12)' : (issue ? '#FFF8E1' : 'white'),
+                                      borderColor: isSelected ? 'primary.main' : isManager ? MANAGER_BORDER : (issue ? '#ED6C02' : 'transparent'),
+                                      bgcolor: isSelected ? (isManager ? MANAGER_BG_SELECTED : 'rgba(25, 118, 210, 0.12)') : isManager ? MANAGER_BG : (issue ? '#FFF8E1' : 'white'),
                                       transition: 'all 0.2s ease',
-                                      '&:hover': { bgcolor: isSelected ? undefined : 'rgba(25, 118, 210, 0.08)' }
+                                      '&:hover': { bgcolor: isSelected ? undefined : isManager ? 'rgba(123, 31, 162, 0.08)' : 'rgba(25, 118, 210, 0.08)' }
                                     }}
                                   >
                                     <Box display="flex" alignItems="center" justifyContent="space-between" gap={1}>
                                       <Box display="flex" alignItems="center" gap={1} flex={1}>
-                                        {issue && <Warning fontSize="small" sx={{ color: '#ED6C02' }} />}
+                                        {isManager ? <PersonPin fontSize="small" sx={{ color: MANAGER_COLOR }} /> : issue ? <Warning fontSize="small" sx={{ color: '#ED6C02' }} /> : null}
                                         <Typography variant="body2">{item.text}</Typography>
                                       </Box>
                                       {item.estimated_hours && (
                                         <Chip size="small" label={`${item.estimated_hours} ч`}
-                                          sx={{ bgcolor: 'rgba(25, 118, 210, 0.1)', color: 'primary.main', fontWeight: 600, fontSize: '0.7rem', height: 24, minWidth: 48 }} />
+                                          sx={{ bgcolor: isManager ? 'rgba(123, 31, 162, 0.1)' : 'rgba(25, 118, 210, 0.1)', color: isManager ? MANAGER_COLOR : 'primary.main', fontWeight: 600, fontSize: '0.7rem', height: 24, minWidth: 48 }} />
                                       )}
                                     </Box>
                                   </Box>
@@ -1440,6 +1496,7 @@ export default function AgentKP() {
                                 {catFeatures.map((item, idx) => {
                                   const issue = getIssueForItem('key_features', item.text);
                                   const isSelected = selectedItem?.field === 'key_features' && selectedItem?.text === item.text;
+                                  const isManager = isManagerItem(item);
                                   return (
                                     <Box
                                       key={idx}
@@ -1449,19 +1506,21 @@ export default function AgentKP() {
                                         borderRadius: 1.5,
                                         cursor: 'pointer',
                                         border: '1px solid',
-                                        borderColor: isSelected ? 'primary.main' : (issue ? (issue.type === 'impossible' ? '#D32F2F' : issue.type === 'contradictory' ? '#0288D1' : '#ED6C02') : 'transparent'),
-                                        bgcolor: isSelected ? 'rgba(25, 118, 210, 0.12)' : (issue ? (issue.type === 'impossible' ? '#FFEBEE' : issue.type === 'contradictory' ? '#E3F2FD' : '#FFF8E1') : 'white'),
+                                        borderColor: isSelected ? 'primary.main' : isManager ? MANAGER_BORDER : (issue ? (issue.type === 'impossible' ? '#D32F2F' : issue.type === 'contradictory' ? '#0288D1' : '#ED6C02') : 'transparent'),
+                                        bgcolor: isSelected ? (isManager ? MANAGER_BG_SELECTED : 'rgba(25, 118, 210, 0.12)') : isManager ? MANAGER_BG : (issue ? (issue.type === 'impossible' ? '#FFEBEE' : issue.type === 'contradictory' ? '#E3F2FD' : '#FFF8E1') : 'white'),
                                         transition: 'all 0.2s ease',
-                                        '&:hover': { bgcolor: isSelected ? undefined : 'rgba(25, 118, 210, 0.08)' }
+                                        '&:hover': { bgcolor: isSelected ? undefined : isManager ? 'rgba(123, 31, 162, 0.08)' : 'rgba(25, 118, 210, 0.08)' }
                                       }}
                                     >
                                       <Box display="flex" alignItems="center" justifyContent="space-between" gap={1}>
                                         <Box display="flex" alignItems="center" gap={1} flex={1}>
-                                          {issue && (
+                                          {isManager ? (
+                                            <PersonPin fontSize="small" sx={{ color: MANAGER_COLOR }} />
+                                          ) : issue ? (
                                             issue.type === 'impossible' ? <ErrorIcon fontSize="small" sx={{ color: '#D32F2F' }} /> :
                                               issue.type === 'contradictory' ? <SyncProblem fontSize="small" sx={{ color: '#0288D1' }} /> :
                                                 <Warning fontSize="small" sx={{ color: '#ED6C02' }} />
-                                          )}
+                                          ) : null}
                                           <Typography variant="body2">{item.text}</Typography>
                                         </Box>
                                         {item.estimated_hours && (
@@ -1469,8 +1528,8 @@ export default function AgentKP() {
                                             size="small"
                                             label={`${item.estimated_hours} ч`}
                                             sx={{
-                                              bgcolor: 'rgba(25, 118, 210, 0.1)',
-                                              color: 'primary.main',
+                                              bgcolor: isManager ? 'rgba(123, 31, 162, 0.1)' : 'rgba(25, 118, 210, 0.1)',
+                                              color: isManager ? MANAGER_COLOR : 'primary.main',
                                               fontWeight: 600,
                                               fontSize: '0.7rem',
                                               height: 24,
@@ -1519,12 +1578,13 @@ export default function AgentKP() {
                           return integrationsItems.map((item, idx) => {
                             const issue = getIssueForItem('client_integrations', item.text);
                             const isSelected = selectedItem?.field === 'client_integrations' && selectedItem?.text === item.text;
+                            const isManager = isManagerItem(item);
                             return (
                               <Chip
                                 key={idx}
                                 label={item.text}
                                 onClick={() => setSelectedItem({ field: 'client_integrations', text: item.text, source: item.source_quote || item.source, page_number: item.page_number, rag_confidence: item.rag_confidence, issue })}
-                                icon={issue ? (
+                                icon={isManager ? <PersonPin fontSize="small" /> : issue ? (
                                   issue.type === 'impossible' ? <ErrorIcon fontSize="small" /> :
                                     issue.type === 'contradictory' ? <SyncProblem fontSize="small" /> :
                                       <Warning fontSize="small" />
@@ -1538,10 +1598,10 @@ export default function AgentKP() {
                                     whiteSpace: 'normal',
                                     overflow: 'visible'
                                   },
-                                  borderColor: isSelected ? 'primary.main' : undefined,
-                                  bgcolor: issue ? (issue.type === 'impossible' ? '#FFEBEE' : issue.type === 'contradictory' ? '#E3F2FD' : '#FFF8E1') : undefined,
+                                  borderColor: isSelected ? 'primary.main' : isManager ? MANAGER_BORDER : undefined,
+                                  bgcolor: isManager && !isSelected ? MANAGER_BG : issue ? (issue.type === 'impossible' ? '#FFEBEE' : issue.type === 'contradictory' ? '#E3F2FD' : '#FFF8E1') : undefined,
                                   '& .MuiChip-icon': {
-                                    color: issue?.type === 'impossible' ? '#D32F2F' : issue?.type === 'contradictory' ? '#0288D1' : '#ED6C02'
+                                    color: isManager ? MANAGER_COLOR : issue?.type === 'impossible' ? '#D32F2F' : issue?.type === 'contradictory' ? '#0288D1' : '#ED6C02'
                                   }
                                 }}
                                 variant={isSelected ? 'filled' : 'outlined'}
@@ -1603,13 +1663,28 @@ export default function AgentKP() {
                           size="small"
                           sx={{
                             textTransform: 'capitalize',
-                            bgcolor: 'primary.main',
+                            bgcolor: selectedItem.source === MANAGER_SOURCE_TAG ? MANAGER_COLOR : 'primary.main',
                             color: 'white',
                             fontWeight: 500,
                             fontSize: '0.7rem',
                             height: 24
                           }}
                         />
+                        {selectedItem.source === MANAGER_SOURCE_TAG && (
+                          <Chip
+                            icon={<PersonPin fontSize="small" />}
+                            label="Требование менеджера"
+                            size="small"
+                            sx={{
+                              bgcolor: MANAGER_BG,
+                              color: MANAGER_COLOR,
+                              fontWeight: 600,
+                              fontSize: '0.7rem',
+                              height: 24,
+                              '& .MuiChip-icon': { color: MANAGER_COLOR }
+                            }}
+                          />
+                        )}
                         {selectedItem.page_number && selectedItem.page_number > 0 && (
                           <Chip
                             label={`Страница ${selectedItem.page_number}`}
@@ -1644,7 +1719,28 @@ export default function AgentKP() {
                       </Typography>
                       <Divider sx={{ mb: 1.5 }} />
 
-                      {selectedItem.source ? (
+                      {selectedItem.source === MANAGER_SOURCE_TAG ? (
+                        <Paper
+                          elevation={0}
+                          sx={{
+                            p: 2,
+                            bgcolor: MANAGER_BG,
+                            borderRadius: 1.5,
+                            border: '1px solid',
+                            borderColor: MANAGER_BORDER
+                          }}
+                        >
+                          <Box display="flex" alignItems="center" gap={1} mb={1}>
+                            <PersonPin fontSize="small" sx={{ color: MANAGER_COLOR }} />
+                            <Typography variant="caption" sx={{ color: MANAGER_COLOR, fontWeight: 600 }}>
+                              Требование менеджера
+                            </Typography>
+                          </Box>
+                          <Typography variant="body2" color="text.secondary" sx={{ fontStyle: 'italic' }}>
+                            Этот пункт добавлен на основе дополнительных указаний менеджера, а не из текста ТЗ.
+                          </Typography>
+                        </Paper>
+                      ) : selectedItem.source ? (
                         <Paper
                           elevation={0}
                           sx={{

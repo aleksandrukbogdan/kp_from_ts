@@ -253,3 +253,14 @@ class RequirementAnalysisResult(BaseModel):
 
 class ProposalResult(BaseModel):
     markdown_content: str = Field(description="Markdown текст КП")
+
+# --- Manager Notes Classification ---
+class ManagerNoteItem(BaseModel):
+    text: str = Field(description="Краткая формулировка требования менеджера. НА РУССКОМ ЯЗЫКЕ.")
+    category: Literal[
+        "business_goal", "tech_stack", "integration",
+        "module", "screen", "report", "nfr"
+    ] = Field(description="Категория требования: business_goal (бизнес-цель), tech_stack (технология), integration (интеграция), module (модуль/функция), screen (экран/UI), report (отчёт), nfr (нефункциональное)")
+
+class ManagerNotesResult(BaseModel):
+    items: List[ManagerNoteItem] = Field(default_factory=list, description="Список классифицированных требований менеджера")
