@@ -8,6 +8,9 @@ export default defineConfig({
     host: true,
     allowedHosts: ['.nir.center'],
     port: 5173,
+    fs: {
+      allow: ['/']
+    },
     watch: {
       usePolling: true,
       interval: 1000,

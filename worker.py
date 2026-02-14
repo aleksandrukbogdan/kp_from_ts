@@ -14,13 +14,15 @@ from activities import (
     analyze_requirements_chunk_activity, # New
     refine_requirements_activity, # New
     enrich_with_rag_activity, # RAG enrichment
-    classify_manager_notes_activity # Manager notes classification
+    classify_manager_notes_activity, # Manager notes classification
+    deduplicate_data_activity # Deduplication & Summarization
 )
 from workflows import ProposalWorkflow
+from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner, SandboxRestrictions, SandboxMatcher
 
 async def main():
     client = await Client.connect("temporal-server:7233") #подключение к темпорал серверу
-#добавить 2 воркера: 1 для обычной очереди другой для gpu
+    #добавить 2 воркера: 1 для обычной очереди другой для gpu
     worker_cpu = Worker(
         client,
         task_queue="proposal-queue",
@@ -30,7 +32,25 @@ async def main():
             save_budget_stub, 
             index_document_activity, # Replaced split_text
             merge_data_activity
-        ]
+        ],
+        workflow_runner=SandboxedWorkflowRunner(
+            restrictions=SandboxRestrictions(
+                invalid_modules=SandboxMatcher(),
+                invalid_module_members=SandboxMatcher(),
+                passthrough_modules={
+                    "numpy",
+                    "torch",
+                    "sentence_transformers",
+                    "google",
+                    "tensorflow",
+                    "huggingface_hub",
+                    "rag_service",
+                    "activities",
+                    "logging",
+                    "dateutil",
+                }
+            )
+        )
     )
     
     worker_gpu = Worker(
@@ -47,7 +67,8 @@ async def main():
             analyze_requirements_chunk_activity, # New (LLM)
             refine_requirements_activity, # New (Embeddings/Search)
             enrich_with_rag_activity, # RAG enrichment
-            classify_manager_notes_activity # Manager notes
+            classify_manager_notes_activity, # Manager notes
+            deduplicate_data_activity # Deduplication & Summarization
         ]
     )
     print("Workers started")

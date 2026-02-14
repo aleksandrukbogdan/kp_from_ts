@@ -114,10 +114,21 @@ def merge_extracted_data(data_list: List[ExtractedTZData]) -> ExtractedTZData:
     if best_client:
         start_data.client_name = best_client
         
-    # 2. Merge Project Essence (Select longest as it's likely most descriptive)
+    # 2. Merge Project Essence (Smart Selection)
     candidates_essence = [d.project_essence for d in data_list if d.project_essence.text not in ["Unknown Essence", "", "N/A"]]
     if candidates_essence:
-        start_data.project_essence = max(candidates_essence, key=lambda x: len(x.text))
+        # Heuristic: Prefer "denser" text (more capitalized words / length ratio) + length
+        # But for now, let's just avoid "Intro" spam.
+        
+        def score_essence(st: SourceText) -> int:
+            t = st.text
+            score = len(t)
+            # Penalize generic intros if they dominate (simple heuristic)
+            if t.strip().lower().startswith("this document") or t.strip().lower().startswith("данный документ"):
+                score -= 50
+            return score
+            
+        start_data.project_essence = max(candidates_essence, key=score_essence)
         
     # 3. Merge Project Type (Voting)
     candidates_type = [d.project_type for d in data_list]

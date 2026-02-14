@@ -13,9 +13,11 @@ export const config = {
     API_URL: '/api',
 
     // Keycloak
-    KEYCLOAK_URL: 'http://10.109.50.250:5058',
-    KEYCLOAK_REALM: 'platform',
-    KEYCLOAK_CLIENT_ID: 'agent-kp',
+    // Keycloak
+    // Keycloak
+    KEYCLOAK_URL: import.meta.env.VITE_KEYCLOAK_URL || 'https://auth.nir.center',
+    KEYCLOAK_REALM: import.meta.env.VITE_KEYCLOAK_REALM || 'platform',
+    KEYCLOAK_CLIENT_ID: import.meta.env.VITE_KEYCLOAK_CLIENT_ID || 'agent-kp',
 
     // Внешние сервисы
     RAG_BOT_URL: `http://10.109.50.250:5111`,

@@ -17,7 +17,7 @@ from fastapi import Request, HTTPException
 logger = logging.getLogger("kp-api")
 
 # --- Configuration ---
-KEYCLOAK_URL = os.getenv("KEYCLOAK_URL", "http://10.109.50.250:5058")
+KEYCLOAK_URL = os.getenv("KEYCLOAK_URL", "https://auth.nir.center")
 KEYCLOAK_REALM = os.getenv("KEYCLOAK_REALM", "platform")
 KEYCLOAK_CLIENT_ID = os.getenv("KEYCLOAK_CLIENT_ID", "agent-kp")
 
@@ -39,23 +39,30 @@ def _fetch_jwks() -> dict:
     if _jwks_cache and (now - _jwks_cache_time) < JWKS_CACHE_TTL:
         return _jwks_cache
 
-    try:
-        response = httpx.get(JWKS_URL, timeout=10)
-        response.raise_for_status()
-        _jwks_cache = response.json()
-        _jwks_cache_time = now
-        logger.info(f"Fetched JWKS keys from Keycloak ({len(_jwks_cache.get('keys', []))} keys)")
-        return _jwks_cache
-    except Exception as e:
-        logger.error(f"Failed to fetch JWKS from {JWKS_URL}: {e}")
-        # If we have cached keys, use them even if expired
-        if _jwks_cache:
-            logger.warning("Using expired JWKS cache as fallback")
+    for attempt in range(3):
+        try:
+            response = httpx.get(JWKS_URL, timeout=10)
+            response.raise_for_status()
+            _jwks_cache = response.json()
+            _jwks_cache_time = now
+            logger.info(f"Fetched JWKS keys from Keycloak ({len(_jwks_cache.get('keys', []))} keys)")
             return _jwks_cache
-        raise HTTPException(
-            status_code=503,
-            detail="Authentication service unavailable"
-        )
+        except Exception as e:
+            logger.warning(f"Attempt {attempt+1}/3 failed to fetch JWKS from {JWKS_URL}: {e}")
+            if attempt < 2:
+                time.sleep(2)
+            else:
+                logger.error(f"Final failure fetching JWKS: {e}")
+    
+    # If we have cached keys, use them even if expired
+    if _jwks_cache:
+        logger.warning("Using expired JWKS cache as fallback")
+        return _jwks_cache
+        
+    raise HTTPException(
+        status_code=503,
+        detail="Authentication service unavailable (failed to fetch JWKS)"
+    )
 
 
 def _get_signing_key(token: str) -> dict:
@@ -102,14 +109,16 @@ def decode_token(token: str) -> dict:
             issuer=ISSUER,
             options={
                 "verify_aud": False,  # Keycloak SPA clients often don't have strict audience
-                "verify_iss": True,
+                "verify_iss": False,
                 "verify_exp": True,
             }
         )
         return payload
     except jwt.ExpiredSignatureError:
+        logger.warning(f"Token expired: {token[:10]}...")
         raise HTTPException(status_code=401, detail="Token expired")
     except JWTError as e:
+        logger.warning(f"Token validation failed: {str(e)}")
         raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
 
 

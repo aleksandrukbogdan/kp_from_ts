@@ -11,9 +11,12 @@ from activities import (
     index_document_activity,
     extract_chunk_activity,
     merge_data_activity,
+    deduplicate_data_activity, # New
     enrich_with_rag_activity,
     analyze_project_activity,
-    classify_manager_notes_activity
+    classify_manager_notes_activity,
+    analyze_requirements_chunk_activity, # New
+    refine_requirements_activity # New
 )
 
 @workflow.defn
@@ -99,8 +102,9 @@ class ProposalWorkflow:
         # User requested speedup but GPU is at 96% load.
         # BATCH_SIZE = 3 (Safe start)
         # Optimization: With larger chunks (50k chars), we lower concurrency to avoid OOM.
-        BATCH_SIZE = 1
+        BATCH_SIZE = 3 # Increased to allow VLLM continuous batching
         partial_results = []
+        partial_analysis_results = [] # Store Phase 1.5 results
         
         
         for i in range(0, len(chunks_defs), BATCH_SIZE):
@@ -116,9 +120,31 @@ class ProposalWorkflow:
                 )
                 for chunk_def in batch_chunks
             ]
+            
+            # Phase 1.5: Detailed Analysis (Reverse RAG prep)
+            analyze_futures = [
+                 workflow.execute_activity(
+                    analyze_requirements_chunk_activity,
+                    args=[chunk_def],
+                    task_queue="gpu-queue",
+                    start_to_close_timeout=timedelta(minutes=60)
+                )
+                for chunk_def in batch_chunks
+            ]
 
-            results_extract = await asyncio.gather(*extract_futures)
+            # Run both sets of activities
+            # combine futures to ensure all are awaited/scheduled even if one fails
+            all_futures = extract_futures + analyze_futures
+            all_results = await asyncio.gather(*all_futures)
+            
+            # Split results
+            # extract results are the first len(extract_futures)
+            num_extract = len(extract_futures)
+            results_extract = all_results[:num_extract]
+            results_analysis = all_results[num_extract:]
+            
             partial_results.extend(results_extract)
+            partial_analysis_results.extend(results_analysis)
         
         # 5. Merge (Reduce Phase)
         partial_results = [r for r in partial_results if r is not None]
@@ -130,6 +156,33 @@ class ProposalWorkflow:
             start_to_close_timeout=timedelta(minutes=2)
         )
         
+        # 5.1 Flatten and Refine Detailed Requirements (Phase 3)
+        flat_requirements = []
+        for batch in partial_analysis_results:
+            if batch:
+                flat_requirements.extend(batch)
+                
+        if flat_requirements:
+             refined_requirements = await workflow.execute_activity(
+                refine_requirements_activity,
+                args=[flat_requirements],
+                task_queue="gpu-queue",
+                start_to_close_timeout=timedelta(minutes=10)
+            )
+             # Inject into merged data (Side-car data)
+             merged_data_dict["detailed_requirements"] = refined_requirements
+        
+        # 5.2 Deduplication & Compression
+        # Ensures context fits in next steps
+        # Use versioning to prevent non-determinism for running workflows
+        if workflow.patched("deduplicate-v1"):
+            merged_data_dict = await workflow.execute_activity(
+                deduplicate_data_activity,
+                args=[merged_data_dict],
+                task_queue="gpu-queue",
+                start_to_close_timeout=timedelta(minutes=5)
+            )
+
         # 5.5 RAG Enrichment (NotebookLM-style)
         # Enriches all fields with source quotes from vector search
         merged_data_dict = await workflow.execute_activity(

@@ -128,7 +128,7 @@ IS_DEV = os.getenv('IS_DEV', 'false').lower() == 'true'
 SERVER_ADDRESS = 'localhost' if IS_DEV else '10.109.50.250'
 
 # Keycloak URL for CORS
-KEYCLOAK_URL = os.getenv('KEYCLOAK_URL', 'http://10.109.50.250:5058')
+KEYCLOAK_URL = os.getenv('KEYCLOAK_URL', 'https://auth.nir.center')
 
 # CORS: Разрешаем React и Keycloak обращаться к API
 app.add_middleware(
@@ -137,6 +137,8 @@ app.add_middleware(
         f"http://{SERVER_ADDRESS}:5173",
         f"http://{SERVER_ADDRESS}:8090",
         "http://localhost:5173",  # Всегда разрешаем localhost для удобства отладки
+        "http://10.109.50.250:8090", # Explicitly allow remote dev IP
+        "http://10.109.50.250:5173",
         KEYCLOAK_URL,
     ],
     allow_credentials=True,
@@ -422,4 +424,10 @@ async def download_docx(request: DownloadRequest, req: Request, user: str = Depe
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Disable uvicorn access logger to avoid duplicate/spam logs
+    # We rely on our custom RequestContextMiddleware for structured JSON logging
+    log_config = uvicorn.config.LOGGING_CONFIG
+    log_config["loggers"]["uvicorn.access"]["level"] = "WARNING"
+    log_config["loggers"]["uvicorn.error"]["level"] = "INFO"
+    
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_config=log_config)

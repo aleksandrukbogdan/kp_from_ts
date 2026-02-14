@@ -13,28 +13,46 @@ from typing import List, Dict, Optional, Any
 from dotenv import load_dotenv
 import logging
 
+from llm_service import LLMService
+from utils_text import merge_extracted_data
+from schemas import (
+    ExtractedTZData, 
+    RequirementAnalysisResult, 
+    ManagerNotesResult, 
+    BudgetResult, 
+    ProposalResult, 
+    AnalysisTZResult, 
+    SourceText,
+    RequirementAnalysisItem
+)
+
 # Suppress annoying RapidOCR warnings
-logging.getLogger("RapidOCR").setLevel(logging.ERROR)
-logging.getLogger("rapidocr").setLevel(logging.ERROR)
+# Move imports to top level to avoid importlib KeyError in threads
+import subprocess
+import mimetypes
+try:
+    from pdf2image import convert_from_path
+except ImportError:
+    pass # Handle gracefully if missing
+
+try:
+    import docx
+except ImportError:
+    pass
+
+# Docling Imports (Top-level)
+HAS_DOCLING = False
+try:
+    from docling.datamodel.base_models import InputFormat
+    from docling.document_converter import DocumentConverter, PdfFormatOption
+    from docling.datamodel.pipeline_options import PdfPipelineOptions, AcceleratorOptions, AcceleratorDevice
+    HAS_DOCLING = True
+except ImportError:
+    print("Docling libraries not found/installed.")
 
 # New Modules
 from llm_service import LLMService
-from schemas import (
-    ExtractedTZData, 
-    AnalysisTZResult, 
-    BudgetResult, 
-    ProposalResult, 
-    KeyFeaturesDetails,
-    SourceText,
-    RequirementAnalysisResult,
-    RequirementAnalysisItem,
-    ManagerNotesResult
-)
-from utils_text import split_markdown, merge_extracted_data
-
-load_dotenv()
-
-MODEL_NAME = os.getenv("QWEN_MODEL_NAME")
+# ... existing imports ...
 
 # --- Global Shared Resources ---
 _doc_converter = None
@@ -47,12 +65,12 @@ def get_docling_converter():
         if _doc_converter is not None:
             return _doc_converter
 
+        if not HAS_DOCLING:
+            # Fallback wrapper or None
+            return None
+
         # --- Docling Integration ---
         try:
-            from docling.datamodel.base_models import InputFormat
-            from docling.document_converter import DocumentConverter, PdfFormatOption
-            from docling.datamodel.pipeline_options import PdfPipelineOptions, AcceleratorOptions, AcceleratorDevice
-            
             is_dev = os.getenv("IS_DEV", "false").lower() == "true"
             
             # Setup Pipeline with potential CUDA support
@@ -84,34 +102,14 @@ def get_docling_converter():
                 }
             )
             print("Docling initialized successfully.")
-
-        except ImportError as e:
-            print(f"Docling Import Error: {e}. Check if 'docling' is in requirements.txt and installed.")
-            # We can't return a converter if we can't import the class, so we might return None or raise
-            # But the fallback below uses DocumentConverter() which ALSO needs the import? 
-            # If import fails, we are dead in the water for Docling.
-            # But maybe the user has an old version? 
-            # Re-raising ensures we see the log.
-            # However, to be safe for the 'parse_file_activity' let's allow it to fail there or return a dummy if completely missing.
-            # Raising is better so the user knows.
-            raise RuntimeError(f"Docling libraries missing: {e}") from e
+            return _doc_converter
 
         except Exception as e:
-            print(f"Docling Init Error (Configuration): {e}. Attempting fallback to default CPU config.")
-            try:
-                # Fallback to simplest possible init
-                _doc_converter = DocumentConverter()
-                print("Docling fallback initialized.")
-            except Exception as e2:
-                print(f"Docling Fallback Failed: {e2}")
-                raise e2
-        
-        return _doc_converter
+            print(f"Docling Init Error: {e}")
+            raise e
 
 def _convert_docx_to_pdf(docx_path: Path) -> Path:
     """Convert DOCX to PDF using LibreOffice. Returns path to PDF file."""
-    import subprocess
-    
     output_dir = docx_path.parent
     pdf_path = output_dir / f"{docx_path.stem}.pdf"
     
@@ -156,7 +154,6 @@ async def parse_file_activity(file_path: str, file_name: str, convert_to_pdf_for
         file_name: Original filename
         convert_to_pdf_for_pages: If True, converts DOCX to PDF before parsing to enable page number extraction
     """
-    doc_converter = get_docling_converter()
     input_path = Path(file_path)
     original_path = input_path  # Keep for reference
 
@@ -173,6 +170,10 @@ async def parse_file_activity(file_path: str, file_name: str, convert_to_pdf_for
     try:
         activity.logger.info(f"Docling: Starting parsing for {input_path}...")
         
+        doc_converter = get_docling_converter()
+        if not doc_converter:
+             raise RuntimeError("Docling converter not initialized")
+
         # Offload CPU-bound task to a separate thread to prevent blocking Temporal heartbeat
         def _run_docling():
             return doc_converter.convert(input_path)
@@ -190,9 +191,12 @@ async def parse_file_activity(file_path: str, file_name: str, convert_to_pdf_for
         try:
             if str(input_path).endswith(".docx"):
                 activity.logger.info("Attempting lightweight DOCX fallback...")
-                import docx
-                doc = docx.Document(file_path)
-                markdown_text = "\n\n".join([p.text for p in doc.paragraphs if p.text.strip()])
+                # docx already imported at top level if available
+                if 'docx' in globals():
+                    doc = docx.Document(file_path)
+                    markdown_text = "\n\n".join([p.text for p in doc.paragraphs if p.text.strip()])
+                else:
+                    activity.logger.warning("python-docx not installed, cannot use fallback.")
         except Exception as fallback_e:
             activity.logger.error(f"Fallback Error: {fallback_e}")
 
@@ -209,12 +213,14 @@ async def parse_file_activity(file_path: str, file_name: str, convert_to_pdf_for
 
     # Save Docling JSON (for RAG Metadata)
     try:
-        json_filename = f"{input_path.stem}_parsed.json"
-        json_path = input_path.parent / json_filename
-        # docling export_to_dict returns a dict, needed for detailed layout info
-        doc_dict = result.document.export_to_dict()
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(doc_dict, f, ensure_ascii=False, default=str)
+        # Only if we have a Docling result
+        if 'result' in locals():
+            json_filename = f"{input_path.stem}_parsed.json"
+            json_path = input_path.parent / json_filename
+            # docling export_to_dict returns a dict, needed for detailed layout info
+            doc_dict = result.document.export_to_dict()
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(doc_dict, f, ensure_ascii=False, default=str)
     except Exception as e:
         activity.logger.error(f"Failed to save Docling JSON: {e}")
         
@@ -224,9 +230,6 @@ async def parse_file_activity(file_path: str, file_name: str, convert_to_pdf_for
 async def ocr_document_activity(file_path: str) -> str:
     """Fallback OCR if standard parsing fails. Handles Images and PDFs."""
     try:
-        import mimetypes
-        from pdf2image import convert_from_path
-
         # Determine if it's a PDF
         mime_type, _ = mimetypes.guess_type(file_path)
         is_pdf = mime_type == 'application/pdf' or file_path.lower().endswith('.pdf')
@@ -238,6 +241,9 @@ async def ocr_document_activity(file_path: str) -> str:
             # Convert first 5 pages max to avoid overload
             # fmt='jpeg' matches the data url we generally use
             try:
+                if 'convert_from_path' not in globals():
+                     raise ImportError("pdf2image not installed")
+                     
                 images = convert_from_path(file_path, first_page=1, last_page=5, fmt='jpeg')
                 for img in images:
                     # Save to bytes
@@ -365,11 +371,38 @@ async def estimate_hours_activity(tz_data: dict, stages: list, roles: list, addi
                 t_stack_txt.append(val)
         t_stack_str = ", ".join(t_stack_txt)
 
+        # Fix: Include Key Features in context (Manager notes often land here)
+        k_features = tz_data.get('key_features', {})
+        k_features_txt = ""
+        if isinstance(k_features, dict):
+             for category, items in k_features.items():
+                 if not items: continue
+                 
+                 item_texts = []
+                 if isinstance(items, list):
+                     for item in items:
+                        val = item.get('text', str(item)) if isinstance(item, dict) else str(item)
+                        item_texts.append(val)
+                 
+                 if item_texts:
+                      k_features_txt += f"\n- {category}: {', '.join(item_texts)}"
+        elif isinstance(k_features, list):
+             # Fallback if list
+             temp = []
+             for item in k_features:
+                  val = item.get('text', str(item)) if isinstance(item, dict) else str(item)
+                  temp.append(val)
+             k_features_txt = ", ".join(temp)
+        else:
+             k_features_txt = str(k_features)
+
         user_prompt = f"""{reference_context}
 
 ТЕКУЩИЙ ПРОЕКТ:
 Суть: {p_essence_txt}
 Стек: {t_stack_str}
+Функционал (Key Features): {k_features_txt}
+
 {f'''
 Дополнительные указания заказчика:
 {additional_notes}''' if additional_notes else ''}
@@ -874,6 +907,10 @@ async def extract_chunk_activity(chunk_def: Dict[str, Any]) -> dict:
     - Если это мобильное приложение - Mobile.
     - Если сайт - Web.
 - key_features: Разбей найденное на категории.
+- tech_stack: Сюда пиши ТОЛЬКО конкретные технологии (языки, БД, фреймворки).
+    - ПРИМЕР: "Python", "PostgreSQL", "React", "Redis".
+    - ЗАПРЕЩЕНО писать предложениями ("Бэкенд на Python").
+    - ЗАПРЕЩЕНО писать требования ("Высокая нагрузка", "Интеграция с 1С"). Только технологии.
 
 ВАЖНОЕ ПРАВИЛО ФОРМАТИРОВАНИЯ:
 - В полях 'text' пиши ЧИСТЫЙ ТЕКСТ.
@@ -962,6 +999,162 @@ async def merge_data_activity(data_list: List[dict]) -> dict:
         return ExtractedTZData(project_essence=SourceText(text=f"Merge Error: {e}")).model_dump()
 
 @activity.defn
+async def deduplicate_data_activity(merged_data: dict) -> dict:
+    """
+    Deduplicates and refines the merged data to prevent context overflow.
+    Merges semantically similar requirements and summarizes verbose text.
+    """
+    llm = LLMService()
+    activity.logger.info("Starting Semantic Deduplication & Compression...")
+
+    # Helper to clean lists with aggressive filtering
+    async def clean_list(items: List[dict], category_name: str, max_items: int = 20, force_llm: bool = False) -> List[dict]:
+        if not items:
+            return items
+            
+        # Extract text for modification
+        texts = [item.get('text', '') for item in items if item.get('text')]
+        if not texts:
+            return items
+
+        # 0. Deduplicate by text first (always)
+        seen = set()
+        unique_items = []
+        for item in items:
+            txt = item.get('text', '').strip()
+            if txt and txt not in seen:
+                seen.add(txt)
+                unique_items.append(item)
+        
+        items = unique_items
+        texts = [i.get('text', '') for i in items]
+
+        # Skip if list is already small/concise (unless forced)
+        total_chars = sum(len(t) for t in texts)
+        if not force_llm and len(texts) <= max_items and total_chars < 2000:
+             return items
+
+        try:
+            # Simple text-based deduplication first
+            unique_texts = list(set(texts))
+            
+            # Semantic Deduplication & Filtering with LLM
+            prompt = f"""
+            Ты - редактор технических заданий. 
+            Твоя цель - сократить список {category_name}, оставив ТОЛЬКО {max_items} самых важных пунктов.
+            
+            Входящий список ({len(unique_texts)} пунктов):
+            {json.dumps(unique_texts[:50], ensure_ascii=False)} 
+            (показаны первые 50, если список больше)
+            
+            Инструкция:
+            1. Объедини синонимы (Смысловые дубликаты).
+            2. Убери воду.
+            3. Оставь максимум {max_items} критически важных пунктов.
+            4. ВЕРНИ ТОЛЬКО JSON МАССИВ СТРОК.
+            """
+            
+            response = await llm.create_chat_completion(
+                messages=[{"role": "user", "content": prompt}]
+            )
+            
+            # Try to parse JSON array from response
+            cleaned_texts = []
+            try:
+                # Clean up markdown code blocks
+                clean_response = response.replace("```json", "").replace("```", "").strip()
+                cleaned_texts = json.loads(clean_response)
+            except json.JSONDecodeError:
+                 cleaned_texts = [line.strip('- *') for line in response.split('\n') if line.strip() and not line.startswith('[')]
+
+            # Reconstruct items
+            new_items = []
+            if isinstance(cleaned_texts, list):
+                for text in cleaned_texts[:max_items]: # Enforce hard limit
+                    if isinstance(text, str):
+                        new_items.append({"text": text, "source": "AI_Filtered"})
+            else:
+                return items[:max_items] 
+                    
+            return new_items
+            
+        except Exception as e:
+            activity.logger.error(f"Deduplication failed for {category_name}: {e}")
+            return items[:max_items]
+
+    # 1. Deduplicate & Filter Lists
+    merged_data['business_goals'] = await clean_list(merged_data.get('business_goals', []), "Бизнес-цели", max_items=15)
+    merged_data['tech_stack'] = await clean_list(merged_data.get('tech_stack', []), "Стек технологий", max_items=15)
+    merged_data['client_integrations'] = await clean_list(merged_data.get('client_integrations', []), "Интеграции", max_items=15, force_llm=True)
+    
+    # 2. Key Features (Nested)
+    kf = merged_data.get('key_features', {})
+    if isinstance(kf, dict):
+        for category, items in kf.items():
+            if isinstance(items, list):
+                kf[category] = await clean_list(items, f"Функционал: {category}", max_items=10)
+        merged_data['key_features'] = kf
+
+    # 3. Summarize Project Essence if too massive (> 5000 chars)
+    p_essence = merged_data.get('project_essence', {})
+    p_text = p_essence.get('text', '') if isinstance(p_essence, dict) else str(p_essence)
+    
+    if len(p_text) > 5000:
+        try:
+            activity.logger.info(f"Summarizing massive project_essence ({len(p_text)} chars)...")
+            
+            # Recursive Map-Reduce for Summarization
+            async def recursive_summarize(text: str, chunk_size: int = 15000) -> str:
+                if len(text) <= chunk_size:
+                    # Base case: valid size for single call
+                    msg = [{
+                        "role": "user",
+                        "content": f"Сделай краткую выжимку (summary) сути проекта. Максимум 4000 знаков. Сохрани все важные детали, технологии и цифры.\n\nТекст:\n{text}"
+                    }]
+                    return await llm.create_chat_completion(messages=msg)
+                
+                # Recursive step: Split and summarize parts
+                chunks = []
+                for i in range(0, len(text), chunk_size):
+                    chunks.append(text[i : i + chunk_size])
+                
+                activity.logger.info(f"Map-Reduce: Split into {len(chunks)} chunks...")
+                
+                # Process sequentially to avoid rate limits (or parallel if quota allows)
+                summaries = []
+                for i, chunk in enumerate(chunks):
+                    # Overlap: include last 500 chars of previous to maintain context continuity (optional, simple split here)
+                    summary_part = await recursive_summarize(chunk, chunk_size)
+                    summaries.append(summary_part)
+                
+                # Reduce
+                combined_summary = "\n\n".join(summaries)
+                activity.logger.info(f"Map-Reduce: Reduced to {len(combined_summary)} chars. Recursing if needed...")
+                
+                # Verify if reduction was effective enough, if not, recurse on the result
+                if len(combined_summary) > chunk_size:
+                     return await recursive_summarize(combined_summary, chunk_size)
+                
+                return combined_summary
+
+            # Execute Map-Reduce
+            summary = await recursive_summarize(p_text)
+            
+            if isinstance(merged_data['project_essence'], dict):
+                merged_data['project_essence']['text'] = summary
+            else:
+                merged_data['project_essence'] = {"text": summary}
+        except Exception as e:
+             activity.logger.error(f"Summarization failed: {e}")
+             # Fallback: Truncate nicely if completely failed
+             if isinstance(merged_data['project_essence'], dict):
+                 merged_data['project_essence']['text'] = p_text[:20000] + "\n[Summarization Error - Truncated]"
+             else:
+                 merged_data['project_essence'] = {"text": p_text[:20000] + "\n[Summarization Error - Truncated]"}
+
+    return merged_data
+
+@activity.defn
 async def analyze_project_activity(merged_data: dict, additional_notes: str = "") -> dict:
     """
     Phase 2: Analysis based on aggregated data.
@@ -978,7 +1171,78 @@ async def analyze_project_activity(merged_data: dict, additional_notes: str = ""
         "key_features": merged_data.get("key_features", {}), 
     }
     
-    context_json = json.dumps(condensed_data, indent=2, ensure_ascii=False)
+    # Strip RAG metadata fields
+    _RAG_FIELDS = frozenset(('source_quote', 'rag_confidence', 'page_number', 'bbox', 'confidence_score', 'source'))
+    def strip_rag_fields(data):
+        if isinstance(data, dict):
+            return {k: strip_rag_fields(v) for k, v in data.items() if k not in _RAG_FIELDS}
+        if isinstance(data, list):
+            return [strip_rag_fields(item) for item in data]
+        return data
+    
+    clean_data = strip_rag_fields(condensed_data)
+    context_json = json.dumps(clean_data, ensure_ascii=False)
+    
+    # SAFETY CHECK & SMART COMPRESSION
+    # Target: 32k tokens ~ 100k chars. Safe buffer -> 80k chars.
+    MAX_CHARS = 80000 
+    
+    if len(context_json) > MAX_CHARS:
+        activity.logger.warning(f"Context JSON too large ({len(context_json)} chars). Starting Smart Compression...")
+
+        # Stage 1: Remove formatting/whitespace from JSON
+        clean_data = strip_rag_fields(condensed_data) # Ensure clean start
+        context_json = json.dumps(clean_data, ensure_ascii=False, separators=(',', ':'))
+        
+        # Stage 2: Summarize Project Essence (if still too big)
+        if len(context_json) > MAX_CHARS:
+             p_essence = clean_data.get('project_essence', {})
+             p_text = p_essence.get('text', '') if isinstance(p_essence, dict) else str(p_essence)
+             
+             if len(p_text) > 4000:
+                 activity.logger.info("Compression Stage 2: Truncating Essence to 4k chars (Summarization should have happened in dedupe)...")
+                 # We assume deduplicate_activity already summarized, but if it's still huge, hard cut.
+                 truncated_text = p_text[:4000] + "... [TRUNCATED]"
+                 if isinstance(clean_data['project_essence'], dict):
+                     clean_data['project_essence']['text'] = truncated_text
+                 else:
+                     clean_data['project_essence'] = truncated_text
+                 context_json = json.dumps(clean_data, ensure_ascii=False, separators=(',', ':'))
+
+        # Stage 3: Compress Lists (Business Goals, Tech Stack)
+        if len(context_json) > MAX_CHARS:
+             activity.logger.info("Compression Stage 3: Compressing lists...")
+             for field in ['business_goals', 'tech_stack']:
+                 items = clean_data.get(field, [])
+                 if isinstance(items, list) and len(items) > 10:
+                     # Keep top 10 only
+                     clean_data[field] = items[:10]
+             context_json = json.dumps(clean_data, ensure_ascii=False, separators=(',', ':'))
+
+        # Stage 4: Aggressive Key Features Compression
+        if len(context_json) > MAX_CHARS:
+             activity.logger.info("Compression Stage 4: Stripping Key Features descriptions...")
+             kf = clean_data.get('key_features', {})
+             for cat, items in kf.items():
+                 if isinstance(items, list):
+                     new_items = []
+                     for item in items:
+                         # Keep only the 'text' field and truncate it if very long
+                         if isinstance(item, dict):
+                             txt = item.get('text', '')
+                             if len(txt) > 100:
+                                 txt = txt[:100] + "..."
+                             new_items.append({"text": txt})
+                         else:
+                             new_items.append(item)
+                     kf[cat] = new_items
+             context_json = json.dumps(clean_data, ensure_ascii=False, separators=(',', ':'))
+
+        # Stage 5: Emergency Truncation (Last Resort)
+        if len(context_json) > MAX_CHARS:
+            activity.logger.warning("Compression Failed. Applying Emergency Truncation.")
+            context_json = context_json[:MAX_CHARS] + "... [CRITICAL TRUNCATION]"
+
     # END OPTIMIZATION
     
     try:
@@ -1002,8 +1266,8 @@ async def analyze_project_activity(merged_data: dict, additional_notes: str = ""
 3. Оцени часы (от 4 до 100) на КАЖДУЮ функцию из key_features.
 
 ВАЖНО ДЛЯ requirement_issues:
-- Поле "item_text" должно содержать ТОЛЬКО текст требования (например: "Система должна работать офлайн"). 
-- НЕ пиши туда JSON или Python-объекты вроде "text='...' source='...'".
+- Поле "item_text" должно содержать ТОЛЬКО текст требования. 
+- НЕ пиши туда JSON.
 - Если проблема общая, напиши суть своими словами.
                 """}
             ],

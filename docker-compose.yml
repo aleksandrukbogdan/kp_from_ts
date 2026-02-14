@@ -12,7 +12,7 @@ services:
     volumes:
       - ./frontend:/app
       - /app/node_modules
-    command: sh -c "npm install && npm run dev -- --host"
+    command: sh -c "npm config set fetch-retries 5 && npm install --no-audit && npm run dev -- --host"
     ports:
       - "8090:5173" # Доступ к сайту через http://IP:8090
     ulimits:
@@ -61,11 +61,15 @@ services:
     #   - "8000:8000" 
     env_file: .env
     environment:
-      - KEYCLOAK_URL=http://10.109.50.250:5058
-      - KEYCLOAK_REALM=platform
-      - KEYCLOAK_CLIENT_ID=agent-kp
+      # - KEYCLOAK_URL... lines removed to use .env values
+      - KEYCLOAK_URL=${KEYCLOAK_URL}
+      - KEYCLOAK_REALM=${KEYCLOAK_REALM}
+      - KEYCLOAK_CLIENT_ID=${KEYCLOAK_CLIENT_ID}
+      - HF_HOME=/shared_data/huggingface
     depends_on:
       - temporal-server
+    extra_hosts:
+      - "auth.nir.center:host-gateway"
     networks:
       - ai_platform_network
       - monitoring_network
@@ -84,9 +88,12 @@ services:
     command: python worker.py
     env_file: .env
     environment:
+      - HF_HOME=/shared_data/huggingface
       - RUST_LOG=temporalio_sdk_core=error # Скрыть WARN логи Temporal
     depends_on:
       - temporal-server
+    extra_hosts:
+      - "auth.nir.center:host-gateway"
     networks:
       - ai_platform_network
     volumes:

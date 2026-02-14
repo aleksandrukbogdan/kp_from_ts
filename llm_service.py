@@ -30,6 +30,7 @@ class LLMProcessingError(Exception):
 class LLMService:
     _instance = None
     _client = None
+    _use_guided_generation = None  # Cached flag
 
     def __new__(cls):
         if cls._instance is None:
@@ -42,6 +43,10 @@ class LLMService:
         base_url = os.getenv("QWEN_BASE_URL")
         api_key = os.getenv("QWEN_API_KEY")
         self.model_name = os.getenv("QWEN_MODEL_NAME", "qwen-2.5-32b-instruct")
+        
+        # Guided Generation: use json_schema for constrained decoding (vLLM Outlines/LMFE)
+        # Set USE_GUIDED_GENERATION=true to enable. Works with Qwen2-VL, Qwen3-VL on vLLM.
+        self._use_guided_generation = os.getenv("USE_GUIDED_GENERATION", "true").lower() == "true"
 
         if not base_url or not api_key:
             logger.warning("Missing QWEN_BASE_URL or QWEN_API_KEY. LLM calls will fail.")
@@ -51,7 +56,8 @@ class LLMService:
             api_key=api_key,
             max_retries=0 # We handle retries manually
         )
-        logger.info(f"LLMService initialized with model: {self.model_name}")
+        mode_str = "json_schema (guided)" if self._use_guided_generation else "json_object"
+        logger.info(f"LLMService initialized with model: {self.model_name}, structured output: {mode_str}")
 
     def _clean_json_string(self, content: str) -> str:
         """Cleans Markdown code blocks and common formatting issues from JSON string."""
@@ -77,10 +83,25 @@ class LLMService:
         Handles retries for transient errors.
         Raises LLMProcessingError for specific failures.
         """
-        # Prepare Schema for Prompting
-        schema_json = json.dumps(output_model.model_json_schema(), ensure_ascii=False, indent=2)
+        # Prepare Schema
+        model_schema = output_model.model_json_schema()
+        schema_json = json.dumps(model_schema, ensure_ascii=False, indent=2)
         
-        # Inject Schema
+        # Determine response_format based on guided generation flag
+        if self._use_guided_generation:
+            response_fmt = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": tool_name,
+                    "schema": model_schema
+                }
+            }
+            mode_label = "json_schema (guided)"
+        else:
+            response_fmt = {"type": "json_object"}
+            mode_label = "json_object"
+        
+        # Inject Schema into prompt (helps model understand semantics even with guided generation)
         current_messages = [m.copy() for m in messages]
         schema_instruction = (
             f"\n\nIMPORTANT: Output MUST be a valid JSON object strictly matching this schema:\n"
@@ -95,12 +116,19 @@ class LLMService:
             current_messages.insert(0, {"role": "system", "content": schema_instruction})
 
         last_exception = None
+        
+        # Prompt size warning
+        prompt_size = sum(len(m.get('content', '') if isinstance(m.get('content'), str) else json.dumps(m.get('content', ''), default=str)) for m in current_messages)
+        if prompt_size > 80000:
+            logger.warning(f"⚠️ [{tool_name}] Prompt size {prompt_size} chars (~{prompt_size // 4} tokens) — risk of context overflow!")
+        else:
+            logger.debug(f"[{tool_name}] Prompt size: {prompt_size} chars (~{prompt_size // 4} tokens)")
 
         for attempt in range(max_retries):
             try:
-                logger.info(f"Requesting '{tool_name}' [Attempt {attempt+1}/{max_retries}] (JSON Mode)")
+                logger.info(f"Requesting '{tool_name}' [Attempt {attempt+1}/{max_retries}] ({mode_label})")
                 
-                # Debug: Log input messages (truncated)
+                # Debug: Log input messages length
                 debug_msgs = json.dumps(current_messages, ensure_ascii=False, default=str)
                 logger.debug(f"LLM Input Messages len: {len(debug_msgs)}")
 
@@ -110,15 +138,14 @@ class LLMService:
                     self._client.chat.completions.create,
                     model=self.model_name,
                     messages=current_messages,
-                    # Removing tools/tool_choice to avoid "tools param requires --jinja flag" error
-                    response_format={"type": "json_object"},
+                    response_format=response_fmt,
                     temperature=temperature,
-                    max_tokens=8192, # Increased for larger JSONs
+                    max_tokens=24000, # Increased to support deep analysis (Phase 1.5)
                     timeout=timeout
                 )
                 
                 elapsed = asyncio.get_event_loop().time() - start_time
-                logger.info(f"LLM Response received in {elapsed:.2f}s")
+                logger.info(f"LLM Response received for '{tool_name}' in {elapsed:.2f}s")
 
                 raw_content = response.choices[0].message.content
                 if not raw_content:
@@ -167,15 +194,16 @@ class LLMService:
                 logger.error(f"Validation/Parsing Error: {e}.")
                 
                 # Self-correction: Feed error back to the model
-                # NOTE: Do NOT append the full response to avoid exponential context growth
+                # REPLACE last user message instead of appending to prevent context growth
                 if attempt < max_retries - 1:
                     logger.info("Feeding error back to model for self-correction...")
                     error_feedback = str(e)[:500]
-                    # Instead of appending response + error, just add a simple retry prompt
-                    current_messages.append({
-                        "role": "user",
-                        "content": f"Предыдущий ответ содержал ошибку JSON: {error_feedback}\n\nПопробуй снова. Верни ТОЛЬКО валидный JSON без markdown-разметки."
-                    })
+                    retry_content = f"Предыдущий ответ содержал ошибку JSON: {error_feedback}\n\nПопробуй снова. Верни ТОЛЬКО валидный JSON без markdown-разметки."
+                    # Replace last user message if exists, otherwise append
+                    if len(current_messages) > 2 and current_messages[-1]['role'] == 'user':
+                        current_messages[-1] = {"role": "user", "content": retry_content}
+                    else:
+                        current_messages.append({"role": "user", "content": retry_content})
                     await asyncio.sleep(1)
                 last_exception = e
 

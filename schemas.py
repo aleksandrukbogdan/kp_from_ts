@@ -121,7 +121,7 @@ class ExtractedTZData(BaseModel):
     project_type: SourceText = Field(default_factory=lambda: SourceText(text="Other"), description="Тип проекта: Web, Mobile, ERP, CRM, AI, Integration, Other.")
     
     business_goals: List[SourceText] = Field(default_factory=list, description="Бизнес-цели")
-    tech_stack: List[SourceText] = Field(default_factory=list, description="Стек")
+    tech_stack: List[SourceText] = Field(default_factory=list, description="Список конкретных технологий (языки, БД, фреймворки). ТОЛЬКО названия. Без требований и описаний.")
     client_integrations: List[SourceText] = Field(default_factory=list, description="Интеграции")
     
     key_features: KeyFeaturesDetails = Field(default_factory=KeyFeaturesDetails, description="Функциональные требования.")

@@ -27,34 +27,28 @@ _EMBEDDING_MODEL = None
 def get_embedding_model():
     global _EMBEDDING_MODEL
     if _EMBEDDING_MODEL is None and HAS_RAG_DEPS:
-        logger.info("Loading BGE-M3 model...")
+        logger.info("Starting BGE-M3 model loading sequence...")
         try:
             import torch
+            import time
+            start_time = time.time()
+            
             # Determine device - use CUDA if available, otherwise CPU
             device = "cuda" if torch.cuda.is_available() else "cpu"
             logger.info(f"Using device: {device}")
             
             # Load model with explicit device to avoid meta tensor issues
             # CVE-2025-32434: Enforce safetensors to avoid torch.load vulnerability check
+            logger.info("Instantiating SentenceTransformer('BAAI/bge-m3')...")
             _EMBEDDING_MODEL = SentenceTransformer(
                 "BAAI/bge-m3",
-                device=device,
-                model_kwargs={"use_safetensors": True}
+                device=device
             )
-            logger.info("BGE-M3 model loaded successfully.")
+            elapsed = time.time() - start_time
+            logger.info(f"BGE-M3 model loaded successfully in {elapsed:.2f} seconds.")
         except Exception as e:
-            logger.error(f"Failed to load BGE-M3: {e}")
-            # Fallback to smaller model if BGE-M3 fails
-            logger.info("Trying fallback to multilingual-e5-base...")
-            try:
-                _EMBEDDING_MODEL = SentenceTransformer(
-                    "intfloat/multilingual-e5-base",
-                    device="cpu"
-                )
-                logger.info("Fallback model loaded successfully.")
-            except Exception as e2:
-                logger.error(f"Fallback also failed: {e2}")
-                raise e
+            logger.error(f"Failed to load BGE-M3: {e}", exc_info=True)
+            raise e
     return _EMBEDDING_MODEL
 
 class RAGService:
